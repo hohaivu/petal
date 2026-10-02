@@ -42,7 +42,7 @@ will free.
   up to the disk's used space **to the byte**.
 - **Findings.** Petal checks the usual suspects first (Trash, Downloads, Xcode build files and
   archives, iOS device support and simulators, iPhone backups, Docker, app caches, npm, Cargo, Gradle,
-  Movies, Mail, `node_modules`, Chrome's update leftovers) and labels each **Safe to delete** or
+  Dart pub cache, Movies, Mail, `node_modules`, Flutter/Dart build files, Chrome's update leftovers) and labels each **Safe to delete** or
   **Review first**, with a one-line explanation. The first ones show up within a fraction of a second.
 - **Savings you can trust.** On APFS, deleting a cloned or hard-linked file may free nothing. Petal
   works out what deleting your selection *really* frees, counting clones and hard links once, and
