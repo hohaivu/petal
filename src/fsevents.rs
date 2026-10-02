@@ -85,6 +85,9 @@ pub fn device_uuid(dev: u64) -> Option<String> {
         }
         let s = CFUUIDCreateString(std::ptr::null(), uuid);
         CFRelease(uuid);
+        if s.is_null() {
+            return None;
+        }
         let mut buf = [0 as c_char; 64];
         let ok = CFStringGetCString(s, buf.as_mut_ptr(), buf.len() as isize, UTF8) != 0;
         CFRelease(s);
@@ -177,14 +180,24 @@ pub fn changes_since(dev: u64, mount: &Path, root: &Path, since: u64) -> Changes
         // "" watches the whole device (empirically: every event on the volume arrives,
         // with paths relative to its mount point and no leading slash).
         let path = CFStringCreateWithBytes(std::ptr::null(), b"".as_ptr(), 0, UTF8, 0);
+        if path.is_null() {
+            return Changes::Reset("could not open the event stream");
+        }
         let paths = CFArrayCreate(std::ptr::null(), &path, 1, &kCFTypeArrayCallBacks as *const c_void);
+        CFRelease(path); // the array retains it
+        if paths.is_null() {
+            return Changes::Reset("could not open the event stream");
+        }
         let stream = FSEventStreamCreateRelativeToDevice(std::ptr::null(), on_events, &context, dev as libc::dev_t, paths, since, 0.0, NO_DEFER);
         CFRelease(paths);
-        CFRelease(path);
         if stream.is_null() {
             return Changes::Reset("could not open the event stream");
         }
         let queue = dispatch_queue_create(c"petal.fsevents".as_ptr(), std::ptr::null());
+        if queue.is_null() {
+            FSEventStreamRelease(stream); // never scheduled: no invalidate
+            return Changes::Reset("could not create a dispatch queue");
+        }
         FSEventStreamSetDispatchQueue(stream, queue);
         let started = FSEventStreamStart(stream) != 0;
         let timed_out = started && {

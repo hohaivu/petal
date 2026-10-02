@@ -54,6 +54,15 @@ pub fn container_of(device: &str) -> Option<&str> {
     Some(&name[..4 + end])
 }
 
+/// "/dev/disk3s1s1" → "disk3s1": the volume a mount (or a snapshot of it) belongs to.
+pub fn volume_of(device: &str) -> Option<&str> {
+    let container = container_of(device)?;
+    let name = device.strip_prefix("/dev/")?;
+    let digits = name[container.len()..].strip_prefix('s')?;
+    let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+    (end > 0).then(|| &name[..container.len() + 1 + end])
+}
+
 pub fn cstr(chars: &[libc::c_char]) -> String {
     unsafe { CStr::from_ptr(chars.as_ptr()) }.to_string_lossy().into_owned()
 }
@@ -77,8 +86,15 @@ pub fn startup_layout(name: String) -> Option<DiskLayout> {
 
     let mut data = None;
     let mut extras = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for mount in mounts {
-        if cstr(&mount.f_fstypename) != "apfs" || container_of(&cstr(&mount.f_mntfromname)) != Some(container.as_str()) {
+        let from = cstr(&mount.f_mntfromname);
+        if cstr(&mount.f_fstypename) != "apfs" || container_of(&from) != Some(container.as_str()) {
+            continue;
+        }
+        // ponytail: getmntinfo lists mounts in mount order and `/` comes first, so a staged
+        // update's second mount of the system volume (Update/mnt1) is the copy dropped.
+        if !seen.insert(volume_of(&from).map(str::to_string)) {
             continue;
         }
         let mount_point = PathBuf::from(cstr(&mount.f_mntonname));
@@ -114,6 +130,11 @@ mod tests {
         assert_eq!(container_of("/dev/disk3s1s1"), Some("disk3"));
         assert_eq!(container_of("/dev/disk12s5"), Some("disk12"));
         assert_eq!(container_of("map auto_home"), None);
+        assert_eq!(volume_of("/dev/disk3s1s1"), Some("disk3s1"));
+        assert_eq!(volume_of("/dev/disk3s1"), Some("disk3s1"));
+        assert_eq!(volume_of("/dev/disk12s5"), Some("disk12s5"));
+        assert_eq!(volume_of("/dev/disk3"), None);
+        assert_eq!(volume_of("map auto_home"), None);
     }
 
     /// The layout must account for exactly what the container reports as used.
