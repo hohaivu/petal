@@ -200,7 +200,13 @@ fn distance(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> f64 {
 }
 
 /// `petal --bench-live <path> [runs]`: how soon the live chart shows the right picture.
+/// With `PETAL_BENCH_INCREMENTAL` set, each run is an incremental rescan from a fresh cache.
 pub fn bench(root: &Path, runs: usize) {
+    let incremental = std::env::var_os("PETAL_BENCH_INCREMENTAL").is_some();
+    if incremental {
+        let (tree, save) = scan::scan_cached(root, &Progress::default(), true);
+        save.expect("this root has no cache").save(&tree);
+    }
     let mut results = Vec::new();
     for run in 0..runs {
         let progress = Arc::new(Progress::default());
@@ -208,7 +214,7 @@ pub fn bench(root: &Path, runs: usize) {
         let handle = {
             let (progress, root) = (progress.clone(), root.to_path_buf());
             std::thread::spawn(move || {
-                let tree = scan::scan(&root, &progress);
+                let tree = if incremental { scan::scan_cached(&root, &progress, false).0 } else { scan::scan(&root, &progress) };
                 (tree, start.elapsed())
             })
         };

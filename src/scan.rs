@@ -786,6 +786,12 @@ pub mod incremental {
     use super::*;
     use crate::cache::Cached;
 
+    /// Called with the live root just before `rescan`'s `charge_links`.
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static BEFORE_CHARGE: std::cell::RefCell<Option<Box<dyn Fn(&LiveNode)>>> = const { std::cell::RefCell::new(None) };
+    }
+
     /// Why `rescan` couldn't run; do a full scan instead.
     #[derive(Debug, PartialEq, Eq)]
     pub enum Fallback {
@@ -827,11 +833,12 @@ pub mod incremental {
             }
         }
 
-        /// Has a hard-linked file somewhere below.
-        fn links(&self, part: &Part) -> bool {
+        /// Not final until `charge_links`: has a hard-linked file below, or reuses cached
+        /// files, which `promote_links` may yet join to a link group found anywhere in the walk.
+        fn pending_links(&self, part: &Part) -> bool {
             match part {
                 Part::Fresh(raw) => raw.links,
-                Part::Reused(ix) => !self.cached.links_in(*ix, self.cached.sub_end[*ix]).is_empty(),
+                Part::Reused(_) => true,
                 Part::Dir { links, .. } => *links,
             }
         }
@@ -899,6 +906,8 @@ pub mod incremental {
         drop(cached);
         promote_links(&nodes, &mut meta, &reused);
         let mut tree = Tree { root_path: root.to_path_buf(), nodes, errors: 0, cloud_only: 0 };
+        #[cfg(test)]
+        BEFORE_CHARGE.with(|hook| hook.borrow().as_ref().map(|f| f(&progress.live)));
         charge_links(&mut tree, &mut meta.links, &progress.live, progress);
         tree.errors = progress.errors.load(Ordering::Relaxed);
         tree.cloud_only = progress.cloud_only.load(Ordering::Relaxed);
@@ -964,7 +973,7 @@ pub mod incremental {
                         Part::Reused(c)
                     };
                     if let Some(own) = &own_live {
-                        if !prior.links(&part) && !self.progress.cancelled.load(Ordering::Relaxed) {
+                        if !prior.pending_links(&part) && !self.progress.cancelled.load(Ordering::Relaxed) {
                             own.done.store(true, Ordering::Release);
                         }
                     }
@@ -982,7 +991,7 @@ pub mod incremental {
                 size += s;
                 items += i;
             }
-            let links = children.iter().any(|c| prior.links(c));
+            let links = children.iter().any(|c| prior.pending_links(c));
             Part::Dir { name, size, items, ino, stamp, links, children }
         }
 
@@ -1009,7 +1018,7 @@ pub mod incremental {
         }
     }
 
-    /// Record a reused folder in the live tree the way the full walk would have, final at once.
+    /// Record a reused folder in the live tree the way the full walk would have.
     /// `live` is its own node within `LIVE_DEPTH`, else its nearest live ancestor's.
     fn seed_live(cached: &Cached, ix: usize, live: &LiveNode, depth: usize) {
         let node = &cached.nodes[ix];
@@ -1027,10 +1036,7 @@ pub mod incremental {
             }
             live.record(size, items);
         }
-        // Folders with hard links become final in `charge_links`.
-        if depth <= LIVE_DEPTH && cached.links_in(ix, cached.sub_end[ix]).is_empty() {
-            live.done.store(true, Ordering::Release);
-        }
+        // Final only in `charge_links`: any reused file may join a link group found later.
     }
 
     /// A reused file that had no other link when cached may have one now: linking it from a
@@ -1679,6 +1685,36 @@ mod tests {
         out
     }
 
+    /// The live state mid-rescan, at its last point before `charge_links`: a reused folder
+    /// whose file gains its first link (lower, elsewhere) must not be final with stale bytes.
+    #[test]
+    fn incremental_reused_not_final_before_charge() {
+        let _guard = fs_heavy();
+        let dir = std::env::temp_dir().join(format!("petal-incr-live-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write(&dir.join("m/f"), 100_000);
+        let dir = fs::canonicalize(&dir).unwrap();
+        let s = full(&dir);
+        assert!(s.1.links.is_empty());
+        fs::create_dir_all(dir.join("a")).unwrap();
+        fs::hard_link(dir.join("m/f"), dir.join("a/new")).unwrap();
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let sink = seen.clone();
+        incremental::BEFORE_CHARGE.with(|h| *h.borrow_mut() = Some(Box::new(move |live: &LiveNode| {
+            let m = live.child("m");
+            sink.set(Some((m.done.load(Ordering::Acquire), m.bytes.load(Ordering::Relaxed))));
+        })));
+        let (b, progress) = rescan(&dir, cache_of(&s.0, &s.1), &["", "a"]);
+        incremental::BEFORE_CHARGE.with(|h| *h.borrow_mut() = None);
+        let (done, bytes) = seen.get().expect("hook ran");
+        assert!(!done, "m published final at {bytes} bytes before charge_links");
+        assert!(progress.reused_dirs.load(Ordering::Relaxed) > 0);
+        let b = b.unwrap().0;
+        assert_eq!(b.nodes[b.find(&dir.join("m/f")).unwrap()].size, 0);
+        assert!(progress.live.child("m").done.load(Ordering::Acquire));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Rescan from `prev`'s cache with `dirty` and check it matches a full scan, links
     /// included, taking the incremental path (some folders reused).
     fn step(dir: &Path, prev: &(Tree, ScanMeta), dirty: &[&str], what: &str) -> (Tree, ScanMeta) {
@@ -2066,6 +2102,7 @@ mod tests {
     #[test]
     #[ignore]
     fn clone_accounting_matches_apfs() {
+        let _guard = fs_heavy();
         use std::process::Command;
         let run = |cmd: &str, args: &[&str]| {
             let out = Command::new(cmd).args(args).output().unwrap();
