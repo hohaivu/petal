@@ -479,6 +479,9 @@ impl SaveCache {
 /// `scan`, but brought up to date from the cache when FSEvents can say what changed.
 /// Only on the startup disk's container: external volumes always scan in full.
 pub fn scan_cached(root: &Path, progress: &Progress, force_full: bool) -> (Tree, Option<SaveCache>) {
+    // Canonical: a folder reached through a symlink or `..` shares one cache, and matches FSEvents paths.
+    let canonical = fs::canonicalize(root);
+    let root = canonical.as_deref().unwrap_or(root);
     let mut save = None;
     let tree = scan_root(root, progress, |root, bases| {
         let (tree, s) = scan_cached_inner(root, progress, bases, force_full);
@@ -499,9 +502,13 @@ fn scan_cached_inner(root: &Path, progress: &Progress, bases: &findings::Bases, 
     };
     let internal = disk::container_at(root).is_some_and(|c| Some(c) == disk::container_at(Path::new("/")));
     let meta = fs::symlink_metadata(root).ok();
-    let target = meta.filter(|_| internal).and_then(|m| Some((m.dev(), m.ino(), fsevents::device_uuid(m.dev())?)));
+    // ponytail: the Data volume always hits the hard-link fallback; drop once hard links re-dedup exactly.
+    let startup_data = root == Path::new("/System/Volumes/Data");
+    let target = meta.filter(|_| internal && !startup_data).and_then(|m| Some((m.dev(), m.ino(), fsevents::device_uuid(m.dev())?)));
     let Some((dev, root_ino, device_uuid)) = target else {
-        log(&How::Full(if internal { "no FSEvents history" } else { "external volume" }));
+        log(&How::Full(if startup_data {
+            "startup disk: hard links"
+        } else if internal { "no FSEvents history" } else { "external volume" }));
         return (scan_with_bases(root, progress, bases), None);
     };
     // Before any listing: changes made during this scan get later ids, so the next one replays them.
@@ -516,8 +523,8 @@ fn scan_cached_inner(root: &Path, progress: &Progress, bases: &findings::Bases, 
             break 'scan full("forced");
         }
         let Some(cached) = cache::load(root, &device_uuid, has_fda) else { break 'scan full("no valid cache") };
-        let (Ok(canonical), Some(mount)) = (fs::canonicalize(root), mount_of(root)) else { break 'scan full("no mount point") };
-        let dirty = match fsevents::changes_since(dev, &mount, &canonical, cached.header.event_id) {
+        let Some(mount) = mount_of(root) else { break 'scan full("no mount point") };
+        let dirty = match fsevents::changes_since(dev, &mount, root, cached.header.event_id) {
             fsevents::Changes::Reset(reason) => break 'scan full(reason),
             fsevents::Changes::Dirs(dirs) => dirs.into_iter().map(|(rel, recursive)| (root.join(rel), recursive)).collect::<Vec<_>>(),
         };
@@ -1132,7 +1139,7 @@ pub fn bench_rescan(root: &Path, runs: usize) -> bool {
     println!("(on a live tree, an occasional MISMATCH can be real changes between the two scans)");
     let (tree, save) = scan_cached(root, &Progress::default(), true);
     let Some(save) = save else {
-        println!("no FSEvents history for this volume (or it's external): every scan is full");
+        println!("every scan of this root is full (external volume, no FSEvents history, or the startup disk)");
         return true;
     };
     save.save(&tree);
@@ -1624,6 +1631,7 @@ mod tests {
         for i in 0..10 {
             write(&dir.join(format!("clean/n{i}/f")), 100 * i);
         }
+        let dir = fs::canonicalize(&dir).unwrap();
         let dev = fs::metadata(&dir).unwrap().dev();
         if fsevents::device_uuid(dev).is_none() {
             eprintln!("skipped: no FSEvents history on this volume");
@@ -1663,6 +1671,17 @@ mod tests {
         assert_eq!((incr.errors, incr.cloud_only), (full.errors, full.cloud_only));
         save.save(&incr);
 
+        // Through a symlink: same canonical root, so the same cache and an incremental rescan.
+        let link = dir.with_extension("link");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let (incr, save) = scan_cached(&link, &Progress::default(), false);
+        let save = save.unwrap();
+        assert!(matches!(save.how, How::Incremental { .. }), "via symlink: {:?}", save.how);
+        assert_eq!(fingerprint(&incr), fingerprint(&scan(&dir, &Progress::default())));
+        save.save(&incr);
+        fs::remove_file(&link).unwrap();
+
         // Access changes: the event names only the parent. Each must converge to a full scan,
         // and stay converged on a quiet rescan from the saved result.
         let _restore = Restore(dir.clone());
@@ -1695,6 +1714,7 @@ mod tests {
         drop(_restore);
         fs::remove_dir_all(&dir).unwrap();
         let _ = fs::remove_dir_all(dir.with_extension("cache"));
+        let _ = fs::remove_file(dir.with_extension("link"));
     }
 
     #[test]
