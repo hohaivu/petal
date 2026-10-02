@@ -162,7 +162,7 @@ background load, and refuses to report a speed-up if the two results differ.
 
 `--bench-rescan` checks the two results for equality. On a live tree like `~/Library`, both scans see
 apps writing files. So a MISMATCH there can be real drift: two full scans differ the same way. Hard
-links don't cause drift: each inode is charged to its lowest-path link, deterministically (ties broken
-by size, then name), so full and incremental scans are byte-exact, and incremental rescans now cover
+links don't cause drift: each inode is charged to the link with the lowest root-relative path, compared
+component by component in name-byte order, so full and incremental scans are byte-exact, and incremental rescans now cover
 `/`. The cache is v4, with a per-file identity, about +24% on a `/` cache (204→253 MB). On a quiet tree (`/Applications`)
 it reports `gate ok`. It exits 1 if any run mismatched.
