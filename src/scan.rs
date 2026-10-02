@@ -465,8 +465,7 @@ fn scan_with_bases(root: &Path, progress: &Progress, bases: &findings::Bases) ->
     debug_assert!(walker.prescanned.lock().unwrap().is_empty(), "a hotspot was never spliced in");
     let flatten_start = std::time::Instant::now();
 
-    // ponytail: a hint only; dataless folders aren't counted in `dirs`, so it can fall short by one realloc.
-    let mut nodes = Vec::with_capacity((progress.files.load(Ordering::Relaxed) + progress.dirs.load(Ordering::Relaxed)) as usize + 1);
+    let mut nodes = Vec::new();
     flatten(raw, None, &mut nodes);
     if std::env::var_os("PETAL_PHASES").is_some() {
         eprintln!("  walk {:.3}s  flatten {:.3}s", (flatten_start - walk_start).as_secs_f64(), flatten_start.elapsed().as_secs_f64());
