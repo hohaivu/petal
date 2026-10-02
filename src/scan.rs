@@ -142,7 +142,7 @@ pub struct Progress {
 }
 
 struct Raw {
-    name: String,
+    name: SharedString,
     size: u64,
     kind: Kind,
     items: u64,
@@ -185,7 +185,7 @@ impl Walker<'_> {
             .entries
             .iter()
             .filter_map(|entry| {
-                let child = path.join(&entry.name);
+                let child = path.join(&*entry.name);
                 self.admissible_dir(&child, entry).then(|| (child, live.child(&entry.name)))
             })
             .collect();
@@ -210,7 +210,7 @@ impl Walker<'_> {
                 // Read the folder's own allocation now (the same attribute its parent's listing
                 // reports), so its total is exact, and final, as soon as this pass ends.
                 let own = dirlist::dir_alloc(path).unwrap_or(0);
-                let raw = self.walk_dir(None, path, display_name(path), own, &live, depth);
+                let raw = self.walk_dir(None, path, display_name(path).into(), own, &live, depth);
                 if depth <= LIVE_DEPTH {
                     live.done.store(true, Ordering::Release);
                 }
@@ -233,7 +233,7 @@ impl Walker<'_> {
         &self,
         parent: Option<&dirlist::Dir>,
         path: &Path,
-        name: String,
+        name: SharedString,
         own: u64,
         live: &LiveNode,
         depth: usize,
@@ -309,7 +309,7 @@ impl Walker<'_> {
         parent_live: &LiveNode,
         depth: usize,
     ) -> Option<Raw> {
-        let path = parent.join(&entry.name);
+        let path = parent.join(&*entry.name);
         if self.skip.contains(&path) || !self.allowed_devices.contains(&entry.dev) {
             return None;
         }
@@ -461,7 +461,7 @@ fn scan_with_bases(root: &Path, progress: &Progress, bases: &findings::Bases) ->
     walker.prescan_hotspots(root, &hotspots);
     walker.prescanned_paths = hotspots.into_iter().map(|(path, _)| path).collect();
     progress.hotspots_done_ms.store(elapsed_ms().max(1), Ordering::Relaxed);
-    let raw = walker.walk_dir(None, root, display_name(root), own, &progress.live, 0);
+    let raw = walker.walk_dir(None, root, display_name(root).into(), own, &progress.live, 0);
     debug_assert!(walker.prescanned.lock().unwrap().is_empty(), "a hotspot was never spliced in");
     let flatten_start = std::time::Instant::now();
 
@@ -520,11 +520,11 @@ pub fn frees_of(paths: &[PathBuf]) -> u64 {
             if entry.is_dir {
                 tally.freed.fetch_add(entry.size, Ordering::Relaxed);
                 if !entry.dataless && entry.dev == dev {
-                    subdirs.push(path.join(&entry.name));
+                    subdirs.push(path.join(&*entry.name));
                 }
             } else {
                 let link = Some((entry.dev, entry.ino, entry.nlink));
-                file(tally, &path.join(&entry.name), entry.size, entry.sharing, link);
+                file(tally, &path.join(&*entry.name), entry.size, entry.sharing, link);
             }
         }
         subdirs.par_iter().for_each(|sub| dir(tally, sub, dev));
@@ -653,7 +653,7 @@ pub fn display_name(path: &Path) -> String {
 fn flatten(raw: Raw, parent: Option<usize>, nodes: &mut Vec<Node>) -> usize {
     let ix = nodes.len();
     nodes.push(Node {
-        name: raw.name.into(),
+        name: raw.name,
         size: raw.size,
         kind: raw.kind,
         parent,

@@ -7,7 +7,7 @@ use std::io;
 use std::path::Path;
 
 pub struct Entry {
-    pub name: String,
+    pub name: gpui::SharedString,
     pub is_dir: bool,
     pub dev: u64,
     pub ino: u64,
@@ -133,7 +133,7 @@ pub fn list_std(path: &Path) -> io::Result<Listing> {
     for entry in std::fs::read_dir(path)?.filter_map(Result::ok) {
         match std::fs::symlink_metadata(entry.path()) {
             Ok(meta) => listing.entries.push(Entry {
-                name: entry.file_name().to_string_lossy().into_owned(),
+                name: entry.file_name().to_string_lossy().into(),
                 is_dir: meta.is_dir(),
                 dev: meta.dev(),
                 ino: meta.ino(),
@@ -325,14 +325,14 @@ mod macos {
                 return None;
             }
         }
-        let mut name = String::new();
+        let mut name = gpui::SharedString::default();
         if returned.commonattr & libc::ATTR_CMN_NAME != 0 {
             let reference_at = at;
             let reference: libc::attrreference_t = read(buf, &mut at);
             let name_start = (reference_at as isize + reference.attr_dataoffset as isize) as usize;
             // The length includes the trailing NUL.
             let bytes = &buf[name_start..name_start + reference.attr_length.saturating_sub(1) as usize];
-            name = String::from_utf8_lossy(bytes).into_owned();
+            name = gpui::SharedString::new(String::from_utf8_lossy(bytes));
         }
         let mut dev = 0u64;
         if returned.commonattr & libc::ATTR_CMN_DEVID != 0 {
@@ -365,7 +365,7 @@ mod macos {
             }
             // The entry reports the covered directory; ask for the mounted volume's device.
             if mount_point {
-                match std::fs::symlink_metadata(parent.join(&name)) {
+                match std::fs::symlink_metadata(parent.join(&*name)) {
                     Ok(meta) => dev = meta.dev(),
                     Err(_) => {
                         *errors += 1;
@@ -457,7 +457,7 @@ mod tests {
             assert_eq!(names(&bulk), names(&std), "names differ in {dir:?}");
             // A folder's own allocation read directly must equal what its parent's listing says.
             for b in bulk.iter().filter(|e| e.is_dir && !e.dataless) {
-                if let Some(alloc) = dir_alloc(&dir.join(&b.name)) {
+                if let Some(alloc) = dir_alloc(&dir.join(&*b.name)) {
                     // Mount points report the mounted volume's root instead; the scanner never
                     // crosses them, so compare only folders on this directory's own volume.
                     let parent_dev = std::fs::symlink_metadata(dir).map(|m| { use std::os::unix::fs::MetadataExt; m.dev() }).ok();
