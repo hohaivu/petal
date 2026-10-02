@@ -73,6 +73,13 @@ What made the biggest difference:
 3. **Final as you go.** A folder is marked final the moment the walk leaves it, and drawn in full
    colour; folders still counting are muted and labelled "≥ size". You can click into the chart
    mid-scan. On a full disk, half the bytes sit in final folders by ~11 s of a ~24 s scan.
+   The exception is an incremental rescan: reused folders and their ancestors stay pending until
+   hard-link reconciliation (`charge_links`) finishes, so no folder is shown final too early. The
+   cost, measured on an incremental `/` rescan (`PETAL_BENCH_INCREMENTAL=1 --bench-live / 3`):
+   final50 went from 0.93–0.94 s to 1.34–1.35 s (about +0.4 s, +43–45%); final90 is unchanged or
+   better (1.34/1.98 s before, 1.35/1.34 s after); `premature-final` is 0. That misses the plan's
+   ~10% threshold, and the user accepted it to keep folders from being shown final early. These are
+   incremental measurements; full-scan paths are unchanged.
 4. **An exact skeleton for the startup disk.** Scanning `/` reads only the Data volume; every other
    APFS volume in the container (macOS itself, Preboot, VM, Recovery, Update) gets an exact slice
    from `ATTR_VOL_SPACEUSED`, and whatever couldn't be read becomes an exact "Not readable" slice.
@@ -128,7 +135,7 @@ instead of 5–9 s.
 It falls back to a full scan when there's any doubt: external volumes (always full), no FSEvents
 history, no cache, a different device UUID or Full Disk Access state than when the cache was written,
 dropped or wrapped events, a remount, a must-rescan above the root, a 10 s history timeout, a replaced
-root, or hard links in a re-listed folder. File ▸ Full Rescan (⌘⇧R) forces a full scan. Folders that
+root. File ▸ Full Rescan (⌘⇧R) forces a full scan. Folders that
 were unreadable are always re-listed, since granting access sends no event. Changing a folder's
 mode, owner or ACL sends an event for its parent only, so each cached folder also keeps its change
 time (ctime, to the nanosecond, read before it was listed): a clean folder whose change time differs
@@ -154,6 +161,8 @@ cargo test -- --ignored                                  # plus the APFS disk-im
 background load, and refuses to report a speed-up if the two results differ.
 
 `--bench-rescan` checks the two results for equality. On a live tree like `~/Library`, both scans see
-apps writing files, and hard links are charged to whichever link the parallel walk reaches first. So a
-MISMATCH there can be real drift: two full scans differ the same way. On a quiet tree (`/Applications`)
+apps writing files. So a MISMATCH there can be real drift: two full scans differ the same way. Hard
+links don't cause drift: each inode is charged to its lowest-path link, deterministically (ties broken
+by size, then name), so full and incremental scans are byte-exact, and incremental rescans now cover
+`/`. The cache is v4, with a per-file identity, about +24% on a `/` cache (204→253 MB). On a quiet tree (`/Applications`)
 it reports `gate ok`. It exits 1 if any run mismatched.
