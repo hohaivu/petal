@@ -17,7 +17,6 @@ system-wide filesystem lock when it's warm.
 | Open each folder with `openat(parent_fd, name)` instead of by full path (falls back to a full path on `EMFILE`) | 1.38× cumulative |
 | Tally files inline; only subfolders become parallel (rayon) tasks; publish progress once per folder | ~1.17× more |
 | 32 KB listing buffer instead of 256 KB | ~1.06× more |
-| Round 2: entry names stored as `SharedString` from the listing on (no second copy in flatten); presized flattened Vec; current-folder label every 64th folder; skip/hotspot lookups only down to the deepest entry. Kept as a bundle: each was within noise alone, flatten fell from ~0.045 s to ~0.026 s on `~/Library` | **Round 2 total vs. round-2 baseline**, `/System/Library`: B/A 0.940 (7/10 pairs) and 0.967 (8/10 pairs) |
 | **Total vs. the first version** | **1.53×** on a 1.5 M-item source tree, **1.79×** on `/System/Library`, about half the CPU |
 
 **Rejected, with reasons:**
@@ -30,16 +29,31 @@ system-wide filesystem lock when it's warm.
 - *More threads, several processes, `searchfs` (catalog search), Spotlight.* No gain (the lock is
   system-wide), or slower than the parallel walk, or blind to most of the disk (Spotlight skips
   `~/Library`, hidden folders and system areas).
-- *Round 2, measured one by one (each step's B/A against the step before; `/System/Library` unless noted):*
-  - entry names as `SharedString`: 0.991 (7/10), 0.968 (6/10); `~/Library` 1.143, 1.041, 0.986. Neutral, kept in the bundle above.
-  - presized flatten Vec: flatten 0.019 s → 0.011 s; 1+2 vs baseline 0.980 (5/10). Neutral, kept in the bundle.
-  - throttled current-folder label: 1.001 (8/10); `~/Library` 1.004. Neutral, kept in the bundle.
-  - depth-gated skip/hotspot lookups: 1.010 (3/10); `~/Library` 0.991. Neutral, kept in the bundle.
+- *Round 2 bundle (reverted): entry names as `SharedString` from the listing on, a presized flatten
+  Vec, the current-folder label every 64th folder, skip/hotspot lookups only down to the deepest
+  entry.* Keep rule, agreed in advance: on `/System/Library`, B/A ≤ 0.99 with B faster in ≥ 7/10
+  pairs, reproducibly; no reproducible median regression on `~/Library`. Every result is listed below,
+  including the failing and noisy ones.
+  - Per step, each B/A against the step before, on `/System/Library` unless noted. Names: 0.991 (7/10),
+    0.968 (6/10), `~/Library` 1.143, 1.041, 0.986. Presized Vec: flatten 0.019 s → 0.011 s; 1+2 vs
+    baseline 0.980 (5/10); 2 vs 1 alone 0.990 (6/10, exact counts) and 0.960 (3/10, count tolerance 5).
+    Label throttle: 1.001 (8/10), `~/Library` 1.004. Depth gate: 1.010 (3/10), `~/Library` 0.991.
+  - First pass, bundle vs baseline: `/System/Library` 0.940 (7/10) and 0.967 (8/10) with count
+    tolerance 5; `~/Library` 1.223 (6/10), 0.947 (10/10), 1.092 (8/10). The reviewer's rerun on
+    `/System/Library` gave 1.003 (5/10).
+  - Re-check, 3 independent rounds on `/System/Library` with exact counts (it was stable that day):
+    1.018 (5/10), 1.016 (3/10), 1.010 (3/10). This fails the rule, so steps 1–4 were reverted.
+  - Re-check, `~/Library`, count tolerance 10. At the default 1 MB byte tolerance, three rounds stopped
+    early on byte drift between back-to-back scans. At a 200 MB byte tolerance: 1.126 (3/8), 1.010
+    (3/8), one stopped early on count drift (17 files). A further 0.532 (5/8) overlapped another run
+    and doesn't count.
+  - Not done: the exact baseline fingerprint check (files=297777 nodes=459648). `/System/Library`
+    drifted to files=297799 nodes=459670 over the session, and `~/Library` keeps changing, so no fixed
+    reference was left to check against. A/B runs still compared A and B within each pair.
 - *Walking one subfolder inline instead of as a rayon task.* Fan-out ≤ 1: 0.977 (6/10), 1.048 (5/10),
   `~/Library` 1.038. Fan-out ≤ 2: 0.891 (8/10), 0.963 (4/10), 1.028 (3/10), 0.934 (8/10), `~/Library` 0.963.
   Pairs won only 23/40: no consistent win.
 - *Parallelising flatten.* It is at most ~1% of scan time (45–68 ms of ~5 s on `~/Library`), so it isn't worth the complexity.
-  Presizing its Vec covered the cheap part.
 - *Reading APFS clone information for every file during the scan.* 12–130% slower. Clone accounting
   moved off the scan path instead (see "Exact savings").
 
