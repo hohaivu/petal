@@ -263,6 +263,7 @@ mod tests {
 
     #[test]
     fn finds_catalog_locations_and_node_modules_once() {
+        let _guard = crate::scan::fs_heavy();
         let dir = std::env::temp_dir().join(format!("petal-findings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let home = dir.join("home");
@@ -295,6 +296,7 @@ mod tests {
 
     #[test]
     fn finds_flutter_artifacts_only_next_to_pubspec() {
+        let _guard = crate::scan::fs_heavy();
         let dir = std::env::temp_dir().join(format!("petal-flutter-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let home = dir.join("home");
@@ -345,6 +347,7 @@ mod tests {
 
     #[test]
     fn no_flutter_finding_without_pubspec() {
+        let _guard = crate::scan::fs_heavy();
         let dir = std::env::temp_dir().join(format!("petal-noflutter-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         write(&dir.join("plain/build/out.bin"), 10_000);

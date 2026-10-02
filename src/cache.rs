@@ -10,16 +10,17 @@ use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-use crate::scan::{Kind, Mark, Node, ScanMeta, Tree};
+use crate::scan::{Kind, Link, Mark, Node, ScanMeta, Tree};
 
 const MAGIC: &[u8; 8] = b"PETALSC1";
 /// Bump whenever scan semantics change.
-const VERSION: u32 = 2;
+const VERSION: u32 = 4;
 const TAG_FILE: u8 = 0;
 const TAG_DIR: u8 = 1;
 const TAG_MARKED: u8 = 0x80;
+/// A hard-linked file: the file's size follows its identity.
+const TAG_LINK: u8 = 0x40;
 const FLAG_DATALESS: u8 = 1;
-const FLAG_HARDLINKS: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
@@ -35,11 +36,20 @@ pub struct Cached {
     pub header: Header,
     /// Pre-order: node `ix`'s subtree is `ix..sub_end[ix]`.
     pub nodes: Vec<Node>,
+    /// Per node, as `ScanMeta::inos`: the inode.
     pub inos: Vec<u64>,
+    /// Per node, as `ScanMeta::stamps`: folders their stamp, files their device.
     pub stamps: Vec<u64>,
     /// Sorted by node index.
     pub marks: Vec<(usize, Mark)>,
+    /// Sorted by node index.
+    pub links: Vec<(usize, Link)>,
     pub sub_end: Vec<usize>,
+}
+
+/// Entries of `v` (sorted by node index) within `ix..end`.
+fn in_range<T>(v: &[(usize, T)], ix: usize, end: usize) -> &[(usize, T)] {
+    &v[v.partition_point(|m| m.0 < ix)..v.partition_point(|m| m.0 < end)]
 }
 
 impl Cached {
@@ -58,9 +68,12 @@ impl Cached {
 
     /// Marks within `ix..end`.
     pub fn marks_in(&self, ix: usize, end: usize) -> &[(usize, Mark)] {
-        let lo = self.marks.partition_point(|m| m.0 < ix);
-        let hi = self.marks.partition_point(|m| m.0 < end);
-        &self.marks[lo..hi]
+        in_range(&self.marks, ix, end)
+    }
+
+    /// Hard links within `ix..end`.
+    pub fn links_in(&self, ix: usize, end: usize) -> &[(usize, Link)] {
+        in_range(&self.links, ix, end)
     }
 }
 
@@ -88,11 +101,18 @@ pub fn encode(tree: &Tree, meta: &ScanMeta, header: &Header) -> Vec<u8> {
     for ix in order {
         let node = &tree.nodes[ix];
         let mark = meta.marks.binary_search_by_key(&ix, |m| m.0).ok().map(|at| meta.marks[at].1);
+        let link = meta.links.binary_search_by_key(&ix, |l| l.0).ok().map(|at| meta.links[at].1);
         let tag = if node.kind == Kind::File { TAG_FILE } else { TAG_DIR };
-        out.push(tag | if mark.is_some() { TAG_MARKED } else { 0 });
+        out.push(tag | if mark.is_some() { TAG_MARKED } else { 0 } | if link.is_some() { TAG_LINK } else { 0 });
         put_bytes(&mut out, node.name.as_bytes());
         if node.kind == Kind::File {
             put_varint(&mut out, node.size);
+            // Identity: the inode, then the device (see `ScanMeta::stamps`).
+            put_varint(&mut out, meta.inos.get(ix).copied().unwrap_or(0));
+            put_varint(&mut out, meta.stamps.get(ix).copied().unwrap_or(0));
+            if let Some(link) = link {
+                put_varint(&mut out, link.size);
+            }
         } else {
             // Own allocation: all children count here, including any volume slices.
             let own = node.size.saturating_sub(node.children.iter().map(|&c| tree.nodes[c].size).sum());
@@ -103,7 +123,7 @@ pub fn encode(tree: &Tree, meta: &ScanMeta, header: &Header) -> Vec<u8> {
         }
         if let Some(mark) = mark {
             put_varint(&mut out, mark.errors);
-            out.push(if mark.dataless { FLAG_DATALESS } else { 0 } | if mark.hardlinks { FLAG_HARDLINKS } else { 0 });
+            out.push(if mark.dataless { FLAG_DATALESS } else { 0 });
         }
     }
     let sum = fnv1a(&out);
@@ -141,6 +161,7 @@ pub fn decode(buf: &[u8]) -> Option<Cached> {
     let mut stamps = Vec::with_capacity(count);
     let mut sub_end = vec![0; count];
     let mut marks = Vec::new();
+    let mut links = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
     while nodes.len() < count {
         let ix = nodes.len();
@@ -148,7 +169,7 @@ pub fn decode(buf: &[u8]) -> Option<Cached> {
             return None;
         }
         let tag = r.byte()?;
-        let kind = match tag & !TAG_MARKED {
+        let kind = match tag & !(TAG_MARKED | TAG_LINK) {
             TAG_FILE if ix > 0 => Kind::File,
             TAG_DIR => Kind::Dir,
             _ => return None,
@@ -161,7 +182,10 @@ pub fn decode(buf: &[u8]) -> Option<Cached> {
         if let Some(parent) = parent {
             nodes[parent].children.push(ix);
         }
-        let (size, items, ino) = if kind == Kind::File { (r.varint()?, 1, 0) } else { (0, 0, 0) };
+        let (size, items) = if kind == Kind::File { (r.varint()?, 1) } else { (0, 0) };
+        if tag & TAG_LINK != 0 && kind != Kind::File {
+            return None;
+        }
         nodes.push(Node { name: name.to_owned().into(), size, kind, parent, children: Vec::new(), items });
         if kind == Kind::Dir {
             let (own, left, ino, stamp) = (r.varint()?, r.varint()?, r.varint()?, r.varint()?);
@@ -169,13 +193,17 @@ pub fn decode(buf: &[u8]) -> Option<Cached> {
             stamps.push(stamp);
             stack.push(Frame { ix, left, own });
         } else {
+            let (ino, dev) = (r.varint()?, r.varint()?);
+            if tag & TAG_LINK != 0 {
+                links.push((ix, Link { dev, ino, size: r.varint()?, fresh: false }));
+            }
             inos.push(ino);
-            stamps.push(0);
+            stamps.push(dev);
             sub_end[ix] = ix + 1;
         }
         if tag & TAG_MARKED != 0 {
             let (errors, flags) = (r.varint()?, r.byte()?);
-            marks.push((ix, Mark { errors, dataless: flags & FLAG_DATALESS != 0, hardlinks: flags & FLAG_HARDLINKS != 0 }));
+            marks.push((ix, Mark { errors, dataless: flags & FLAG_DATALESS != 0 }));
         }
         // Close every folder whose children are all in.
         while let Some(frame) = stack.last().filter(|frame| frame.left == 0) {
@@ -194,7 +222,7 @@ pub fn decode(buf: &[u8]) -> Option<Cached> {
         return None;
     }
     let header = Header { root, device_uuid, event_id, root_ino, has_fda };
-    Some(Cached { header, nodes, inos, stamps, marks, sub_end })
+    Some(Cached { header, nodes, inos, stamps, marks, links, sub_end })
 }
 
 /// Bundle id, so the unbundled binary shares the app's cache.

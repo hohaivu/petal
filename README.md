@@ -160,7 +160,9 @@ src/
    and the biggest slices are exact within a couple of seconds even on a full disk.
 3. **Main walk.** Everything else, depth-first across all cores, reusing the hotspot results. Every
    folder in the top four levels has an atomic running total, and the UI snapshots those ten times a
-   second. A folder is marked final as soon as the walk leaves it.
+   second. A folder is marked final as soon as the walk leaves it, except on an incremental
+   rescan, where reused folders and their ancestors stay pending until hard links are reconciled.
+   Rescans of `/` are incremental too.
 4. **Results.** The finished tree is a flat array of nodes. Findings resolve their exact savings in
    the background (`scan::frees_of`), and results never wait for them.
 

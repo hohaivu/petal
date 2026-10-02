@@ -161,11 +161,39 @@ struct Raw {
     size: u64,
     kind: Kind,
     items: u64,
-    /// Folders only (0 for files).
+    /// The inode (for hard-linked files, their `Link::ino`).
     ino: u64,
-    /// Folders only: `dirlist::Entry::ctime` from just before it was listed.
+    /// Folders: `dirlist::Entry::ctime` from just before it was listed.
+    /// Hard-linked files: their `Link::size` (`size` stays 0 until `charge_links`).
     stamp: u64,
+    /// Files: the device (for hard-linked ones, their `Link::dev`). Packed into `Raw`'s
+    /// padding with `links`, so files don't grow; `dev_t` is 32 bits on macOS.
+    dev: u32,
+    /// Files: hard-linked. Folders: some hard-linked file below.
+    links: bool,
     children: Vec<Raw>,
+}
+
+impl Raw {
+    fn dir(name: String, size: u64, items: u64, ino: u64, stamp: u64, children: Vec<Raw>) -> Raw {
+        let links = children.iter().any(|c| c.links);
+        Raw { name, size, kind: Kind::Dir, items, ino, stamp, dev: 0, links, children }
+    }
+}
+
+/// One hard link to a file: the inode it shares, and the file's size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Link {
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    /// Listed by this scan, not taken from the cache. In memory only, until `charge_links`.
+    pub fresh: bool,
+}
+
+/// Size descending, then name ascending: the one child order every scan path produces.
+fn by_size(a: (u64, &str), b: (u64, &str)) -> std::cmp::Ordering {
+    b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1))
 }
 
 /// Rare per-folder facts an incremental rescan needs to know about the cached tree.
@@ -175,25 +203,25 @@ pub struct Mark {
     pub errors: u64,
     /// Skipped as cloud-only.
     pub dataless: bool,
-    /// Its listing had a file with more than one link.
-    pub hardlinks: bool,
 }
 
 /// What a full scan learns beyond the `Tree`, kept out of it so UI trees don't pay for it.
 pub struct ScanMeta {
-    /// Per node; 0 for files.
+    /// Per node: the inode.
     pub inos: Vec<u64>,
-    /// Per node, as `Raw::stamp`.
+    /// Per node: folders as `Raw::stamp`, files their device. With `inos`, a file's identity,
+    /// which an incremental rescan needs to see that a reused file just gained a hard link.
     pub stamps: Vec<u64>,
     /// Sorted by node index.
     pub marks: Vec<(usize, Mark)>,
+    /// Hard-linked files with another link under the root, sorted by node index.
+    pub links: Vec<(usize, Link)>,
 }
 
 struct Walker<'a> {
     progress: &'a Progress,
     allowed_devices: HashSet<u64>,
     skip: HashSet<PathBuf>,
-    hardlinks: Mutex<HashSet<(u64, u64)>>,
     /// Hotspot folders already scanned; the main walk splices these in instead of
     /// reading them again.
     prescanned: Mutex<HashMap<PathBuf, Raw>>,
@@ -201,8 +229,6 @@ struct Walker<'a> {
     /// without taking a lock for every folder.
     prescanned_paths: HashSet<PathBuf>,
     marks: Mutex<Vec<(PathBuf, Mark)>>,
-    /// Any listed folder had a hard-linked file.
-    saw_hardlink: AtomicBool,
 }
 
 /// Allocated size on disk, which is what actually frees up when a file is deleted.
@@ -231,11 +257,9 @@ impl<'a> Walker<'a> {
             progress,
             allowed_devices,
             skip,
-            hardlinks: Mutex::new(HashSet::new()),
             prescanned: Mutex::new(HashMap::new()),
             prescanned_paths: HashSet::new(),
             marks: Mutex::new(Vec::new()),
-            saw_hardlink: AtomicBool::new(false),
         };
         (walker, root_meta)
     }
@@ -291,6 +315,10 @@ impl<'a> Walker<'a> {
                 // `walk_subdir` fills in the inode when it splices this in.
                 let mut raw = self.walk_dir(None, path, display_name(path), 0, own, &live, depth);
                 raw.stamp = stamp;
+                // Hard links aren't charged until the walk ends: neither final nor a finding yet.
+                if raw.links {
+                    return Some((path.clone(), raw));
+                }
                 if depth <= LIVE_DEPTH {
                     live.done.store(true, Ordering::Release);
                 }
@@ -356,24 +384,20 @@ impl<'a> Walker<'a> {
                 subdirs.push(entry);
                 continue;
             }
-            let mut size = entry.size;
-            if entry.nlink > 1 {
-                mark.hardlinks = true;
-                if !self.hardlinks.lock().unwrap().insert((entry.dev, entry.ino)) {
-                    size = 0;
-                }
-            }
             count += 1;
-            bytes += size;
-            files.push(Raw { name: entry.name, size, kind: Kind::File, items: 1, ino: 0, stamp: 0, children: Vec::new() });
+            // A hard link counts 0 for now; `charge_links` puts each file's bytes on one link.
+            let file = if entry.nlink > 1 {
+                Raw { name: entry.name, size: 0, kind: Kind::File, items: 1, ino: entry.ino, stamp: entry.size, dev: entry.dev as u32, links: true, children: Vec::new() }
+            } else {
+                bytes += entry.size;
+                Raw { name: entry.name, size: entry.size, kind: Kind::File, items: 1, ino: entry.ino, stamp: 0, dev: entry.dev as u32, links: false, children: Vec::new() }
+            };
+            files.push(file);
         }
         self.progress.files.fetch_add(count, Ordering::Relaxed);
         self.progress.bytes.fetch_add(bytes, Ordering::Relaxed);
         live.record(own + bytes, count);
         if mark != Mark::default() {
-            if mark.hardlinks {
-                self.saw_hardlink.store(true, Ordering::Relaxed);
-            }
             self.marks.lock().unwrap().push((path.to_path_buf(), mark));
         }
         (dir, files, subdirs)
@@ -393,7 +417,7 @@ impl<'a> Walker<'a> {
         depth: usize,
     ) -> Raw {
         if self.progress.cancelled.load(Ordering::Relaxed) {
-            return Raw { name, size: 0, kind: Kind::Dir, items: 0, ino, stamp: 0, children: Vec::new() };
+            return Raw::dir(name, 0, 0, ino, 0, Vec::new());
         }
         let (dir, mut children, subdirs) = self.read(parent, path, &name, own, live);
         let subdir_results: Vec<Raw> = subdirs
@@ -402,11 +426,11 @@ impl<'a> Walker<'a> {
             .collect();
         drop(dir);
         children.extend(subdir_results);
-        children.sort_by(|a, b| b.size.cmp(&a.size));
+        children.sort_unstable_by(|a, b| by_size((a.size, &a.name), (b.size, &b.name)));
 
         let size = own + children.iter().map(|c| c.size).sum::<u64>();
         let items = children.iter().map(|c| c.items).sum();
-        Raw { name, size, kind: Kind::Dir, items, ino, stamp: 0, children }
+        Raw::dir(name, size, items, ino, 0, children)
     }
 
     fn walk_subdir(
@@ -438,12 +462,12 @@ impl<'a> Walker<'a> {
             if let Some(own) = &own_live {
                 own.done.store(true, Ordering::Release);
             }
-            return Some(Raw { name: entry.name, size: entry.size, kind: Kind::Dir, items: 0, ino: entry.ino, stamp: entry.ctime, children: Vec::new() });
+            return Some(Raw::dir(entry.name, entry.size, 0, entry.ino, entry.ctime, Vec::new()));
         }
         let mut raw = self.walk_dir(dir, &path, entry.name, entry.ino, entry.size, live, depth);
         raw.stamp = entry.ctime;
         if let Some(own) = &own_live {
-            if !self.progress.cancelled.load(Ordering::Relaxed) {
+            if !raw.links && !self.progress.cancelled.load(Ordering::Relaxed) {
                 own.done.store(true, Ordering::Release);
             }
         }
@@ -502,13 +526,9 @@ fn scan_cached_inner(root: &Path, progress: &Progress, bases: &findings::Bases, 
     };
     let internal = disk::container_at(root).is_some_and(|c| Some(c) == disk::container_at(Path::new("/")));
     let meta = fs::symlink_metadata(root).ok();
-    // ponytail: the Data volume always hits the hard-link fallback; drop once hard links re-dedup exactly.
-    let startup_data = root == Path::new("/System/Volumes/Data");
-    let target = meta.filter(|_| internal && !startup_data).and_then(|m| Some((m.dev(), m.ino(), fsevents::device_uuid(m.dev())?)));
+    let target = meta.filter(|_| internal).and_then(|m| Some((m.dev(), m.ino(), fsevents::device_uuid(m.dev())?)));
     let Some((dev, root_ino, device_uuid)) = target else {
-        log(&How::Full(if startup_data {
-            "startup disk: hard links"
-        } else if internal { "no FSEvents history" } else { "external volume" }));
+        log(&How::Full(if internal { "no FSEvents history" } else { "external volume" }));
         return (scan_with_bases(root, progress, bases), None);
     };
     // Before any listing: changes made during this scan get later ids, so the next one replays them.
@@ -534,12 +554,9 @@ fn scan_cached_inner(root: &Path, progress: &Progress, bases: &findings::Bases, 
                 let relisted = progress.dirs.load(Ordering::Relaxed) - reused;
                 (tree, meta, How::Incremental { relisted, reused })
             }
-            Err(fallback) => {
+            Err(incremental::Fallback::Root) => {
                 progress.reset_counts();
-                full(match fallback {
-                    incremental::Fallback::Root => "root replaced",
-                    incremental::Fallback::HardLinks => "hard links on a changed path",
-                })
+                full("root replaced")
             }
         }
     };
@@ -618,10 +635,10 @@ fn add_volume_slices(tree: &mut Tree, layout: &DiskLayout) {
 /// comes last so it reads as the tail of the ring.
 pub fn sort_children(nodes: &mut [Node], ix: usize) {
     let mut children = std::mem::take(&mut nodes[ix].children);
-    children.sort_by_key(|&c| {
-        let node = &nodes[c];
-        let remainder = node.kind == Kind::Other && (node.name.as_ref() == disk::NOT_SCANNED || node.name.as_ref() == disk::NOT_READABLE);
-        (remainder, std::cmp::Reverse(node.size))
+    let remainder = |node: &Node| node.kind == Kind::Other && (node.name.as_ref() == disk::NOT_SCANNED || node.name.as_ref() == disk::NOT_READABLE);
+    children.sort_unstable_by(|&a, &b| {
+        let (a, b) = (&nodes[a], &nodes[b]);
+        remainder(a).cmp(&remainder(b)).then_with(|| by_size((a.size, &a.name), (b.size, &b.name)))
     });
     nodes[ix].children = children;
 }
@@ -661,20 +678,96 @@ fn scan_with_meta(root: &Path, progress: &Progress, bases: &findings::Bases) -> 
     debug_assert!(walker.prescanned.lock().unwrap().is_empty(), "a hotspot was never spliced in");
     let flatten_start = std::time::Instant::now();
 
-    let mut nodes = Vec::new();
-    let (mut inos, mut stamps) = (Vec::new(), Vec::new());
-    flatten(raw, None, &mut nodes, &mut inos, &mut stamps);
+    let mut tree = Tree { root_path: root.to_path_buf(), nodes: Vec::new(), errors: 0, cloud_only: 0 };
+    let mut meta = ScanMeta { inos: Vec::new(), stamps: Vec::new(), marks: Vec::new(), links: Vec::new() };
+    flatten(raw, None, &mut tree.nodes, &mut meta);
+    let charge_start = std::time::Instant::now();
+    charge_links(&mut tree, &mut meta.links, &progress.live, progress);
     if std::env::var_os("PETAL_PHASES").is_some() {
-        eprintln!("  walk {:.3}s  flatten {:.3}s", (flatten_start - walk_start).as_secs_f64(), flatten_start.elapsed().as_secs_f64());
+        eprintln!(
+            "  walk {:.3}s  flatten {:.3}s  links {:.3}s ({})",
+            (flatten_start - walk_start).as_secs_f64(),
+            (charge_start - flatten_start).as_secs_f64(),
+            charge_start.elapsed().as_secs_f64(),
+            meta.links.len()
+        );
     }
-    let tree = Tree {
-        root_path: root.to_path_buf(),
-        nodes,
-        errors: progress.errors.load(Ordering::Relaxed),
-        cloud_only: progress.cloud_only.load(Ordering::Relaxed),
+    tree.errors = progress.errors.load(Ordering::Relaxed);
+    tree.cloud_only = progress.cloud_only.load(Ordering::Relaxed);
+    meta.marks = resolve_marks(&tree, walker.marks.into_inner().unwrap());
+    (tree, meta)
+}
+
+/// Charge each hard-linked file once, to its link with the lowest path (compared name by
+/// name), and every other link 0. That depends only on which links are under the root, not
+/// on walk order, so full and incremental scans agree. Sizes already charged are corrected
+/// rather than added to, so it is idempotent. The live totals follow, then become final.
+/// A file with no other link under the root is charged in full and then dropped from
+/// `links`, so full and incremental scans keep the same set.
+fn charge_links(tree: &mut Tree, links: &mut Vec<(usize, Link)>, live_root: &LiveNode, progress: &Progress) {
+    // Names from the root down; only link nodes need one.
+    let path_of = |nodes: &[Node], mut ix: usize| {
+        let mut names = Vec::new();
+        while let Some(parent) = nodes[ix].parent {
+            names.push(nodes[ix].name.clone());
+            ix = parent;
+        }
+        names.reverse();
+        names
     };
-    let marks = resolve_marks(&tree, walker.marks.into_inner().unwrap());
-    (tree, ScanMeta { inos, stamps, marks })
+    let mut order: Vec<usize> = (0..links.len()).collect();
+    order.sort_unstable_by_key(|&i| (links[i].1.dev, links[i].1.ino, links[i].0));
+    let mut touched = Vec::new();
+    let mut single = vec![false; links.len()];
+    let groups: Vec<Vec<usize>> = order.chunk_by(|&a, &b| (links[a].1.dev, links[a].1.ino) == (links[b].1.dev, links[b].1.ino)).map(<[usize]>::to_vec).collect();
+    for group in groups {
+        single[group[0]] = group.len() == 1;
+        let paths: Vec<Vec<SharedString>> = group.iter().map(|&i| path_of(&tree.nodes, links[i].0)).collect();
+        let owner = (0..group.len()).min_by(|&a, &b| paths[a].iter().map(|n| n.as_bytes()).cmp(paths[b].iter().map(|n| n.as_bytes()))).unwrap();
+        // A freshly listed size beats a cached one: the file may have changed through a link
+        // in a re-listed folder while the owner's folder was reused.
+        let fresh = |&&i: &&usize| links[i].1.fresh;
+        let size = if links[group[owner]].1.fresh { links[group[owner]].1.size } else { group.iter().find(fresh).map_or(links[group[owner]].1.size, |&i| links[i].1.size) };
+        for (k, &i) in group.iter().enumerate() {
+            let (ix, link) = &mut links[i];
+            link.size = size;
+            let target = if k == owner { size } else { 0 };
+            let delta = target.wrapping_sub(tree.nodes[*ix].size);
+            if delta == 0 {
+                continue;
+            }
+            let mut cur = Some(*ix);
+            while let Some(c) = cur {
+                let node = &mut tree.nodes[c];
+                node.size = node.size.wrapping_add(delta);
+                cur = node.parent;
+                touched.extend(cur);
+            }
+            let path = &paths[k];
+            let mut live = None::<Arc<LiveNode>>;
+            for name in &path[..(path.len() - 1).min(LIVE_DEPTH)] {
+                live = Some(live.as_deref().unwrap_or(live_root).child(name));
+            }
+            live.as_deref().unwrap_or(live_root).adjust(delta as i64);
+            progress.bytes.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+    touched.sort_unstable();
+    touched.dedup();
+    for ix in touched {
+        sort_children(&mut tree.nodes, ix);
+    }
+    let mut k = 0;
+    links.retain(|_| {
+        k += 1;
+        !single[k - 1]
+    });
+    for (_, link) in links.iter_mut() {
+        link.fresh = false;
+    }
+    if !progress.cancelled.load(Ordering::Relaxed) {
+        live_root.finish_below();
+    }
 }
 
 fn meta_stamp(meta: &fs::Metadata) -> u64 {
@@ -693,14 +786,17 @@ pub mod incremental {
     use super::*;
     use crate::cache::Cached;
 
+    /// Called with the live root just before `rescan`'s `charge_links`.
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static BEFORE_CHARGE: std::cell::RefCell<Option<Box<dyn Fn(&LiveNode)>>> = const { std::cell::RefCell::new(None) };
+    }
+
     /// Why `rescan` couldn't run; do a full scan instead.
     #[derive(Debug, PartialEq, Eq)]
     pub enum Fallback {
         /// The root is gone, replaced, or isn't the cached one.
         Root,
-        /// Hard links on a changed path: cached per-folder link sizes can't be re-deduplicated.
-        // ponytail: v1 policy; exact re-dedup during reuse if this falls back too often.
-        HardLinks,
     }
 
     /// A folder in `rescan`'s result, before it is flattened.
@@ -708,7 +804,7 @@ pub mod incremental {
         Fresh(Raw),
         /// A cached subtree reused as is.
         Reused(usize),
-        Dir { name: String, size: u64, items: u64, ino: u64, stamp: u64, children: Vec<Part> },
+        Dir { name: String, size: u64, items: u64, ino: u64, stamp: u64, links: bool, children: Vec<Part> },
     }
 
     /// The cached tree and which of its folders `rescan` must re-list.
@@ -726,6 +822,24 @@ pub mod incremental {
                 Part::Fresh(raw) => (raw.size, raw.items),
                 Part::Reused(ix) => (self.cached.nodes[*ix].size, self.cached.nodes[*ix].items),
                 Part::Dir { size, items, .. } => (*size, *items),
+            }
+        }
+
+        fn name<'a>(&'a self, part: &'a Part) -> &'a str {
+            match part {
+                Part::Fresh(raw) => &raw.name,
+                Part::Reused(ix) => &self.cached.nodes[*ix].name,
+                Part::Dir { name, .. } => name,
+            }
+        }
+
+        /// Not final until `charge_links`: has a hard-linked file below, or reuses cached
+        /// files, which `promote_links` may yet join to a link group found anywhere in the walk.
+        fn pending_links(&self, part: &Part) -> bool {
+            match part {
+                Part::Fresh(raw) => raw.links,
+                Part::Reused(_) => true,
+                Part::Dir { links, .. } => *links,
             }
         }
     }
@@ -772,9 +886,6 @@ pub mod incremental {
                 cur = nodes[i].parent;
             }
         }
-        if cached.marks.iter().any(|(ix, m)| m.hardlinks && on_path[*ix]) {
-            return Err(Fallback::HardLinks);
-        }
 
         dirlist::raise_fd_limit();
         dirlist::disable_cloud_downloads();
@@ -787,20 +898,19 @@ pub mod incremental {
         } else {
             walker.merge(&prior, Tree::ROOT, None, root, name, ino, stamp, own, &progress.live, 0)
         };
-        if walker.saw_hardlink.load(Ordering::Relaxed) {
-            return Err(Fallback::HardLinks);
-        }
 
         let mut cached = prior.cached;
-        let (mut nodes, mut meta) = (Vec::new(), ScanMeta { inos: Vec::new(), stamps: Vec::new(), marks: Vec::new() });
-        emit(part, None, &mut cached, &mut nodes, &mut meta);
+        let (mut nodes, mut meta) = (Vec::new(), ScanMeta { inos: Vec::new(), stamps: Vec::new(), marks: Vec::new(), links: Vec::new() });
+        let mut reused = Vec::new();
+        emit(part, None, &mut cached, &mut nodes, &mut meta, &mut reused);
         drop(cached);
-        let tree = Tree {
-            root_path: root.to_path_buf(),
-            nodes,
-            errors: progress.errors.load(Ordering::Relaxed),
-            cloud_only: progress.cloud_only.load(Ordering::Relaxed),
-        };
+        promote_links(&nodes, &mut meta, &reused);
+        let mut tree = Tree { root_path: root.to_path_buf(), nodes, errors: 0, cloud_only: 0 };
+        #[cfg(test)]
+        BEFORE_CHARGE.with(|hook| hook.borrow().as_ref().map(|f| f(&progress.live)));
+        charge_links(&mut tree, &mut meta.links, &progress.live, progress);
+        tree.errors = progress.errors.load(Ordering::Relaxed);
+        tree.cloud_only = progress.cloud_only.load(Ordering::Relaxed);
         meta.marks.extend(resolve_marks(&tree, walker.marks.into_inner().unwrap()));
         meta.marks.sort_by_key(|m| m.0);
         Ok((tree, meta))
@@ -863,7 +973,7 @@ pub mod incremental {
                         Part::Reused(c)
                     };
                     if let Some(own) = &own_live {
-                        if !self.progress.cancelled.load(Ordering::Relaxed) {
+                        if !prior.pending_links(&part) && !self.progress.cancelled.load(Ordering::Relaxed) {
                             own.done.store(true, Ordering::Release);
                         }
                     }
@@ -873,7 +983,7 @@ pub mod incremental {
             drop(dir);
             let mut children: Vec<Part> = files.into_iter().map(Part::Fresh).collect();
             children.extend(subdir_parts);
-            children.sort_by(|a, b| prior.size(b).0.cmp(&prior.size(a).0));
+            children.sort_unstable_by(|a, b| by_size((prior.size(a).0, prior.name(a)), (prior.size(b).0, prior.name(b))));
 
             let (mut size, mut items) = (own, 0);
             for child in &children {
@@ -881,7 +991,8 @@ pub mod incremental {
                 size += s;
                 items += i;
             }
-            Part::Dir { name, size, items, ino, stamp, children }
+            let links = children.iter().any(|c| prior.pending_links(c));
+            Part::Dir { name, size, items, ino, stamp, links, children }
         }
 
         /// Count a reused cached subtree as if it had just been walked.
@@ -907,7 +1018,7 @@ pub mod incremental {
         }
     }
 
-    /// Record a reused folder in the live tree the way the full walk would have, final at once.
+    /// Record a reused folder in the live tree the way the full walk would have.
     /// `live` is its own node within `LIVE_DEPTH`, else its nearest live ancestor's.
     fn seed_live(cached: &Cached, ix: usize, live: &LiveNode, depth: usize) {
         let node = &cached.nodes[ix];
@@ -925,17 +1036,46 @@ pub mod incremental {
             }
             live.record(size, items);
         }
-        if depth <= LIVE_DEPTH {
-            live.done.store(true, Ordering::Release);
+        // Final only in `charge_links`: any reused file may join a link group found later.
+    }
+
+    /// A reused file that had no other link when cached may have one now: linking it from a
+    /// dirty folder brings no event for the file's own folder. Every file whose identity matches
+    /// a known link group (cached, or listed with nlink > 1) joins `meta.links`, so
+    /// `charge_links` charges the group once. `reused` holds the node ranges taken from the
+    /// cache, sorted; files outside them were just listed, so their size is fresh.
+    fn promote_links(nodes: &[Node], meta: &mut ScanMeta, reused: &[(usize, usize)]) {
+        let keys: HashSet<(u64, u64)> = meta.links.iter().map(|l| (l.1.dev, l.1.ino)).collect();
+        if keys.is_empty() {
+            return;
+        }
+        let mut known = meta.links.iter().map(|l| l.0).peekable();
+        let mut found = Vec::new();
+        for (ix, node) in nodes.iter().enumerate() {
+            if known.next_if_eq(&ix).is_some() || node.kind != Kind::File {
+                continue;
+            }
+            let (dev, ino) = (meta.stamps[ix], meta.inos[ix]);
+            if keys.contains(&(dev, ino)) {
+                let at = reused.partition_point(|r| r.0 <= ix);
+                let fresh = at == 0 || reused[at - 1].1 <= ix;
+                found.push((ix, Link { dev, ino, size: node.size, fresh }));
+            }
+        }
+        if !found.is_empty() {
+            meta.links.extend(found);
+            meta.links.sort_unstable_by_key(|l| l.0);
         }
     }
 
-    /// Flatten a `Part` in pre-order. Reused ranges are moved out of `cached`, not cloned.
-    fn emit(part: Part, parent: Option<usize>, cached: &mut Cached, nodes: &mut Vec<Node>, meta: &mut ScanMeta) -> usize {
+    /// Flatten a `Part` in pre-order. Reused ranges are moved out of `cached`, not cloned,
+    /// and recorded in `reused`.
+    fn emit(part: Part, parent: Option<usize>, cached: &mut Cached, nodes: &mut Vec<Node>, meta: &mut ScanMeta, reused: &mut Vec<(usize, usize)>) -> usize {
         match part {
-            Part::Fresh(raw) => flatten(raw, parent, nodes, &mut meta.inos, &mut meta.stamps),
+            Part::Fresh(raw) => flatten(raw, parent, nodes, meta),
             Part::Reused(ix) => {
                 let (base, end) = (nodes.len(), cached.sub_end[ix]);
+                reused.push((base, base + end - ix));
                 let remap = |i: usize| i - ix + base;
                 for k in ix..end {
                     let node = &mut cached.nodes[k];
@@ -953,15 +1093,17 @@ pub mod incremental {
                 meta.inos.extend_from_slice(&cached.inos[ix..end]);
                 meta.stamps.extend_from_slice(&cached.stamps[ix..end]);
                 meta.marks.extend(cached.marks_in(ix, end).iter().map(|&(k, m)| (remap(k), m)));
+                // Already charged; `charge_links` corrects them if an owner moved.
+                meta.links.extend(cached.links_in(ix, end).iter().map(|&(k, l)| (remap(k), l)));
                 base
             }
-            Part::Dir { name, size, items, ino, stamp, children } => {
+            Part::Dir { name, size, items, ino, stamp, children, .. } => {
                 let ix = nodes.len();
                 nodes.push(Node { name: name.into(), size, kind: Kind::Dir, parent, children: Vec::with_capacity(children.len()), items });
                 meta.inos.push(ino);
                 meta.stamps.push(stamp);
                 for child in children {
-                    let child_ix = emit(child, Some(ix), cached, nodes, meta);
+                    let child_ix = emit(child, Some(ix), cached, nodes, meta, reused);
                     nodes[ix].children.push(child_ix);
                 }
                 ix
@@ -1139,7 +1281,7 @@ pub fn bench_rescan(root: &Path, runs: usize) -> bool {
     println!("(on a live tree, an occasional MISMATCH can be real changes between the two scans)");
     let (tree, save) = scan_cached(root, &Progress::default(), true);
     let Some(save) = save else {
-        println!("every scan of this root is full (external volume, no FSEvents history, or the startup disk)");
+        println!("every scan of this root is full (external volume or no FSEvents history)");
         return true;
     };
     save.save(&tree);
@@ -1206,10 +1348,18 @@ pub fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-fn flatten(raw: Raw, parent: Option<usize>, nodes: &mut Vec<Node>, inos: &mut Vec<u64>, stamps: &mut Vec<u64>) -> usize {
+fn flatten(raw: Raw, parent: Option<usize>, nodes: &mut Vec<Node>, meta: &mut ScanMeta) -> usize {
     let ix = nodes.len();
-    inos.push(raw.ino);
-    stamps.push(raw.stamp);
+    if raw.kind == Kind::File {
+        if raw.links {
+            meta.links.push((ix, Link { dev: raw.dev as u64, ino: raw.ino, size: raw.stamp, fresh: true }));
+        }
+        meta.inos.push(raw.ino);
+        meta.stamps.push(raw.dev as u64);
+    } else {
+        meta.inos.push(raw.ino);
+        meta.stamps.push(raw.stamp);
+    }
     nodes.push(Node {
         name: raw.name.into(),
         size: raw.size,
@@ -1219,7 +1369,7 @@ fn flatten(raw: Raw, parent: Option<usize>, nodes: &mut Vec<Node>, inos: &mut Ve
         items: raw.items,
     });
     for child in raw.children {
-        let child_ix = flatten(child, Some(ix), nodes, inos, stamps);
+        let child_ix = flatten(child, Some(ix), nodes, meta);
         nodes[ix].children.push(child_ix);
     }
     ix
@@ -1318,6 +1468,15 @@ pub fn volumes() -> Vec<Volume> {
     volumes
 }
 
+/// FSEvents replays the whole volume's history, so writes from tests running alongside can
+/// overflow its queue while `fsevents_incremental_end_to_end` reads it ("events dropped").
+/// Every test that writes to the filesystem or reads events takes this.
+#[cfg(test)]
+pub(crate) fn fs_heavy() -> std::sync::MutexGuard<'static, ()> {
+    static FS_HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    FS_HEAVY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1330,6 +1489,7 @@ mod tests {
 
     #[test]
     fn scans_sizes_and_removes_nodes() {
+        let _guard = fs_heavy();
         let dir = std::env::temp_dir().join(format!("petal-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         write(&dir.join("big/a.bin"), 1 << 20);
@@ -1340,11 +1500,14 @@ mod tests {
         let tree = scan(&dir, &Progress::default());
         let root = &tree.nodes[Tree::ROOT];
         assert_eq!(root.items, 4);
-        // Two links to the same 1 MiB file count once, whichever the parallel walk sees first.
-        assert!(root.size < (1 << 20) * 2);
-        assert!(root.size >= (1 << 20) + (1 << 19));
         let big = root.children.iter().copied()
             .find(|&c| tree.nodes[c].name.as_ref() == "big").unwrap();
+        // Two links to the same 1 MiB file count once, on the lower path: big/a.bin, not link.bin.
+        let size_at = |p: &str| tree.nodes[tree.find(&dir.join(p)).unwrap()].size;
+        assert!(size_at("big/a.bin") >= 1 << 20);
+        assert_eq!(size_at("link.bin"), 0);
+        assert!(root.size < (1 << 20) * 2);
+        assert!(std::mem::size_of::<Raw>() <= 88, "hard-link fields must fit Raw's padding");
         // Children are sorted largest first and path_of round-trips.
         let sizes: Vec<u64> = root.children.iter().map(|&c| tree.nodes[c].size).collect();
         assert!(sizes.windows(2).all(|w| w[0] >= w[1]));
@@ -1366,6 +1529,7 @@ mod tests {
     /// plain scan, and the live totals must add up to the same bytes.
     #[test]
     fn hotspot_splice_matches_plain_scan() {
+        let _guard = fs_heavy();
         let dir = std::env::temp_dir().join(format!("petal-hotspots-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let home = dir.join("Users/someone");
@@ -1420,6 +1584,7 @@ mod tests {
 
     #[test]
     fn cache_round_trips() {
+        let _guard = fs_heavy();
         let dir = std::env::temp_dir().join(format!("petal-cache-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         write(&dir.join("a/one.bin"), 5000);
@@ -1430,7 +1595,8 @@ mod tests {
         fs::set_permissions(dir.join("locked"), std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
         let (tree, meta) = full(&dir);
         fs::set_permissions(dir.join("locked"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        assert!(meta.marks.iter().any(|m| m.1.errors > 0) && meta.marks.iter().any(|m| m.1.hardlinks));
+        assert!(meta.marks.iter().any(|m| m.1.errors > 0));
+        assert_eq!(meta.links.len(), 2);
 
         let header = crate::cache::Header { root: dir.clone(), device_uuid: "uuid".into(), event_id: 42, root_ino: meta.inos[0], has_fda: false };
         let file = dir.join("scan.cache");
@@ -1442,6 +1608,7 @@ mod tests {
         assert_eq!(cached.stamps, meta.stamps);
         assert!(meta.stamps[Tree::ROOT] != 0);
         assert_eq!(cached.marks, meta.marks);
+        assert_eq!(cached.links, meta.links);
         let decoded = Tree { root_path: dir.clone(), nodes: cached.nodes, errors: 0, cloud_only: 0 };
         assert_eq!(fingerprint(&decoded), fingerprint(&tree));
         for (ix, &end) in cached.sub_end.iter().enumerate() {
@@ -1460,6 +1627,7 @@ mod tests {
 
     #[test]
     fn incremental_matches_full() {
+        let _guard = fs_heavy();
         let dir = std::env::temp_dir().join(format!("petal-incremental-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         write(&dir.join("keep/a/b/c/d/deep.bin"), 4096);
@@ -1476,6 +1644,7 @@ mod tests {
         for i in 0..20 {
             write(&dir.join(format!("clean/n{i}/f")), 100 * i);
         }
+        let dir = fs::canonicalize(&dir).unwrap();
         let (a, meta) = full(&dir);
         let cached = cache_of(&a, &meta);
 
@@ -1509,32 +1678,195 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Node indices follow walk order, so compare links by path.
+    fn links_by_path(tree: &Tree, meta: &ScanMeta) -> Vec<(PathBuf, Link)> {
+        let mut out: Vec<_> = meta.links.iter().map(|&(ix, l)| (tree.path_of(ix), l)).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The live state mid-rescan, at its last point before `charge_links`: a reused folder
+    /// whose file gains its first link (lower, elsewhere) must not be final with stale bytes.
     #[test]
-    fn incremental_falls_back_on_hardlinks() {
+    fn incremental_reused_not_final_before_charge() {
+        let _guard = fs_heavy();
+        let dir = std::env::temp_dir().join(format!("petal-incr-live-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write(&dir.join("m/f"), 100_000);
+        let dir = fs::canonicalize(&dir).unwrap();
+        let s = full(&dir);
+        assert!(s.1.links.is_empty());
+        fs::create_dir_all(dir.join("a")).unwrap();
+        fs::hard_link(dir.join("m/f"), dir.join("a/new")).unwrap();
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let sink = seen.clone();
+        incremental::BEFORE_CHARGE.with(|h| *h.borrow_mut() = Some(Box::new(move |live: &LiveNode| {
+            let m = live.child("m");
+            sink.set(Some((m.done.load(Ordering::Acquire), m.bytes.load(Ordering::Relaxed))));
+        })));
+        let (b, progress) = rescan(&dir, cache_of(&s.0, &s.1), &["", "a"]);
+        incremental::BEFORE_CHARGE.with(|h| *h.borrow_mut() = None);
+        let (done, bytes) = seen.get().expect("hook ran");
+        assert!(!done, "m published final at {bytes} bytes before charge_links");
+        assert!(progress.reused_dirs.load(Ordering::Relaxed) > 0);
+        let b = b.unwrap().0;
+        assert_eq!(b.nodes[b.find(&dir.join("m/f")).unwrap()].size, 0);
+        assert!(progress.live.child("m").done.load(Ordering::Acquire));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Rescan from `prev`'s cache with `dirty` and check it matches a full scan, links
+    /// included, taking the incremental path (some folders reused).
+    fn step(dir: &Path, prev: &(Tree, ScanMeta), dirty: &[&str], what: &str) -> (Tree, ScanMeta) {
+        let (b, progress) = rescan(dir, cache_of(&prev.0, &prev.1), dirty);
+        let (b, meta_b) = b.unwrap();
+        let (c, meta_c) = full(dir);
+        assert_eq!(fingerprint(&b), fingerprint(&c), "{what}");
+        assert_eq!(links_by_path(&b, &meta_b), links_by_path(&c, &meta_c), "{what}");
+        assert!(progress.reused_dirs.load(Ordering::Relaxed) > 0, "{what}: not incremental");
+        let live = crate::live::snapshot(&progress.live, dir, None).tree;
+        assert_eq!(live.nodes[Tree::ROOT].size, b.nodes[Tree::ROOT].size, "{what}: live totals");
+        (b, meta_b)
+    }
+
+    #[test]
+    fn incremental_hardlinks_match_full() {
+        let _guard = fs_heavy();
         let dir = std::env::temp_dir().join(format!("petal-incr-links-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        write(&dir.join("a/f"), 5000);
-        write(&dir.join("b/g"), 5000);
-        let (tree, meta) = full(&dir);
-        // A new link in a dirty folder.
-        fs::hard_link(dir.join("a/f"), dir.join("a/l")).unwrap();
-        let (result, _) = rescan(&dir, cache_of(&tree, &meta), &["a"]);
-        assert_eq!(result.err(), Some(incremental::Fallback::HardLinks));
-        // A cached link on a changed path.
-        let (tree, meta) = full(&dir);
-        write(&dir.join("a/h"), 1);
-        let (result, _) = rescan(&dir, cache_of(&tree, &meta), &["a"]);
-        assert_eq!(result.err(), Some(incremental::Fallback::HardLinks));
-        // Links off the changed path are fine.
-        let (tree, meta) = full(&dir);
-        write(&dir.join("b/h"), 1);
-        let (result, _) = rescan(&dir, cache_of(&tree, &meta), &["b"]);
-        assert!(result.is_ok());
+        write(&dir.join("m/f"), 5000);
+        fs::create_dir_all(dir.join("z")).unwrap();
+        fs::hard_link(dir.join("m/f"), dir.join("z/l")).unwrap();
+        for i in 0..5 {
+            write(&dir.join(format!("clean{i}/x")), 1000 * i);
+        }
+        let dir = fs::canonicalize(&dir).unwrap();
+        let size_at = |t: &Tree, p: &str| t.nodes[t.find(&dir.join(p)).unwrap()].size;
+        let s = full(&dir);
+        assert!(size_at(&s.0, "m/f") > 0 && size_at(&s.0, "z/l") == 0);
+
+        // (a) A new link at a lower path, in a dirty folder: the owner moves off two reused ones.
+        fs::create_dir_all(dir.join("a")).unwrap();
+        fs::hard_link(dir.join("m/f"), dir.join("a/l2")).unwrap();
+        let s = step(&dir, &s, &["", "a"], "owner moves");
+        assert!(size_at(&s.0, "a/l2") > 0 && size_at(&s.0, "m/f") == 0);
+        // (b) The owner deleted: a link in a clean, reused folder owns again.
+        fs::remove_file(dir.join("a/l2")).unwrap();
+        let s = step(&dir, &s, &["a"], "owner deleted");
+        assert!(size_at(&s.0, "m/f") > 0);
+        // (c) Grown through the owner's dirty folder, the other link's folder clean.
+        write(&dir.join("m/f"), 300_000);
+        let s = step(&dir, &s, &["m"], "grown via owner");
+        assert!(size_at(&s.0, "m/f") >= 300_000);
+        // ... and through the other link, with the owner's folder clean: the fresh size wins.
+        write(&dir.join("z/l"), 900_000);
+        let s = step(&dir, &s, &["z"], "grown via other link");
+        assert!(size_at(&s.0, "m/f") >= 900_000);
+        // (d) Off the dirty path, links are reused as they are.
+        write(&dir.join("clean1/y"), 10);
+        let s = step(&dir, &s, &["clean1"], "links off the path");
+        // (e) No changes: still equal.
+        step(&dir, &s, &[], "quiet");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file's first extra link: the file's own folder has no event, so it is reused as an
+    /// ordinary file and must be found by identity. Then back to one link.
+    #[test]
+    fn incremental_first_link_matches_full() {
+        let _guard = fs_heavy();
+        let dir = std::env::temp_dir().join(format!("petal-incr-first-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write(&dir.join("m/f"), 100_000);
+        for i in 0..3 {
+            write(&dir.join(format!("clean{i}/x")), 1000 * (i + 1));
+        }
+        let dir = fs::canonicalize(&dir).unwrap();
+        let size_at = |t: &Tree, p: &str| t.nodes[t.find(&dir.join(p)).unwrap()].size;
+        let s = full(&dir);
+        assert!(s.1.links.is_empty());
+        let f = size_at(&s.0, "m/f");
+
+        // 1 -> 2: the new link in a new folder above m; m reused.
+        fs::create_dir_all(dir.join("z")).unwrap();
+        fs::hard_link(dir.join("m/f"), dir.join("z/new")).unwrap();
+        let s = step(&dir, &s, &["", "z"], "1->2, link after");
+        assert_eq!((size_at(&s.0, "m/f"), size_at(&s.0, "z/new")), (f, 0));
+        let s = step(&dir, &s, &[], "1->2, link after, quiet");
+        // 2 -> 1: the other link deleted.
+        fs::remove_file(dir.join("z/new")).unwrap();
+        let s = step(&dir, &s, &["z"], "2->1, link after");
+        assert!(s.1.links.is_empty());
+        let s = step(&dir, &s, &[], "2->1, link after, quiet");
+        // 1 -> 2 with the new link lower: it owns, the reused original drops to 0.
+        fs::create_dir_all(dir.join("a")).unwrap();
+        fs::hard_link(dir.join("m/f"), dir.join("a/new")).unwrap();
+        let s = step(&dir, &s, &["", "a"], "1->2, link before");
+        assert_eq!((size_at(&s.0, "a/new"), size_at(&s.0, "m/f")), (f, 0));
+        let s = step(&dir, &s, &[], "1->2, link before, quiet");
+        // 2 -> 1 by deleting the owner: the reused original owns again.
+        fs::remove_file(dir.join("a/new")).unwrap();
+        let s = step(&dir, &s, &["a"], "2->1, owner deleted");
+        assert_eq!(size_at(&s.0, "m/f"), f);
+        assert!(s.1.links.is_empty());
+        step(&dir, &s, &[], "2->1, owner deleted, quiet");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Many links across folders, equal sizes included, for determinism and live totals.
+    fn link_fixture(dir: &Path) {
+        let _ = fs::remove_dir_all(dir);
+        for f in 0..10 {
+            write(&dir.join(format!("src/f{f}")), 4096 * (1 + f % 3));
+            for k in 0..20 {
+                let to = dir.join(format!("d{}/e{}/l{f}", (f * 7 + k) % 20, k % 3));
+                fs::create_dir_all(to.parent().unwrap()).unwrap();
+                fs::hard_link(dir.join(format!("src/f{f}")), to).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn full_scan_deterministic_with_links() {
+        let _guard = fs_heavy();
+        let dir = std::env::temp_dir().join(format!("petal-links-det-{}", std::process::id()));
+        link_fixture(&dir);
+        let (first, meta) = full(&dir);
+        assert_eq!(meta.links.len(), 210);
+        for _ in 0..4 {
+            let (again, meta_again) = full(&dir);
+            assert_eq!(fingerprint(&again), fingerprint(&first));
+            assert_eq!(links_by_path(&again, &meta_again), links_by_path(&first, &meta));
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn live_matches_tree_with_links() {
+        let _guard = fs_heavy();
+        let dir = std::env::temp_dir().join(format!("petal-links-live-{}", std::process::id()));
+        link_fixture(&dir);
+        let check = |tree: &Tree, progress: &Progress| {
+            let live = crate::live::snapshot(&progress.live, &dir, None);
+            for ix in 1..live.tree.nodes.len() {
+                let at = tree.find(&live.tree.path_of(ix)).unwrap();
+                assert_eq!(live.tree.nodes[ix].size, tree.nodes[at].size, "{:?}", live.tree.path_of(ix));
+                assert!(live.done[ix], "{:?} not final", live.tree.path_of(ix));
+            }
+            assert_eq!(progress.bytes.load(Ordering::Relaxed), tree.nodes[Tree::ROOT].size);
+        };
+        let progress = Progress::default();
+        let (tree, meta) = scan_with_meta(&dir, &progress, &findings::Bases::default());
+        check(&tree, &progress);
+        fs::hard_link(dir.join("src/f0"), dir.join("d3/a")).unwrap();
+        let (b, progress) = rescan(&dir, cache_of(&tree, &meta), &["d3"]);
+        check(&b.unwrap().0, &progress);
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn incremental_relists_error_dirs() {
+        let _guard = fs_heavy();
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("petal-incr-errors-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1585,6 +1917,7 @@ mod tests {
     /// cached subtree must not be reused, and the result must stay right on later rescans.
     #[test]
     fn incremental_sees_access_changes() {
+        let _guard = fs_heavy();
         for change in ["chmod", "chgrp", "acl"] {
             let dir = std::env::temp_dir().join(format!("petal-incr-access-{change}-{}", std::process::id()));
             let _restore = Restore(dir.clone());
@@ -1623,6 +1956,7 @@ mod tests {
     /// that must take the incremental path and match a full scan exactly.
     #[test]
     fn fsevents_incremental_end_to_end() {
+        let _guard = fs_heavy();
         let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/target/petal-fsevents-test"));
         let _ = fs::remove_dir_all(&dir);
         write(&dir.join("keep/a/b/deep.bin"), 4096);
@@ -1643,15 +1977,36 @@ mod tests {
         let save = save.expect("internal volume with history");
         assert_eq!(save.how, How::Full("forced"));
         save.save(&tree);
-        let since = cache::load(&dir, &fsevents::device_uuid(dev).unwrap(), onboarding::has_full_disk_access()).unwrap().header.event_id;
+        let (canonical, mount) = (fs::canonicalize(&dir).unwrap(), mount_of(&dir).unwrap());
+        let mut since = cache::load(&dir, &fsevents::device_uuid(dev).unwrap(), onboarding::has_full_disk_access()).unwrap().header.event_id;
+        // Test-only warm-up: the fixture's own creation events can still land after the seed's
+        // watermark. Rescan (each must match the seed) until a replay relists at most the root.
+        let seed = (fingerprint(&tree), tree.errors, tree.cloud_only);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let changes = fsevents::changes_since(dev, &mount, &canonical, since);
+            let fsevents::Changes::Dirs(dirs) = &changes else { panic!("warm-up: {changes:?}") };
+            if dirs.iter().all(|d| d.0.as_os_str().is_empty()) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "fixture history never settled; still relisted (path, recursive): {dirs:?}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (warm, save) = scan_cached(&dir, &Progress::default(), false);
+            assert!((fingerprint(&warm), warm.errors, warm.cloud_only) == seed, "warm-up tree differs from the seed");
+            save.expect("internal volume with history").save(&warm);
+            since = cache::load(&dir, &fsevents::device_uuid(dev).unwrap(), onboarding::has_full_disk_access()).unwrap().header.event_id;
+        }
 
         write(&dir.join("grow/g.bin"), 300000);
         fs::remove_dir_all(dir.join("del/sub")).unwrap();
         write(&dir.join("new/l1/f"), 12345);
         write(&dir.join("keep/a/b/deep.bin"), 200000);
+        // A link pair: one in a new folder, one beside the original.
+        write(&dir.join("grow/linked"), 7000);
+        fs::create_dir_all(dir.join("new/l2")).unwrap();
+        fs::hard_link(dir.join("grow/linked"), dir.join("new/l2/link")).unwrap();
         // Test-only: wait for fseventsd to have the changes on record.
-        let (canonical, mount) = (fs::canonicalize(&dir).unwrap(), mount_of(&dir).unwrap());
-        let wanted = ["grow", "del", "new/l1", "keep/a/b"].map(PathBuf::from);
+        let wanted = ["grow", "del", "new/l1", "new/l2", "keep/a/b"].map(PathBuf::from);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let changes = fsevents::changes_since(dev, &mount, &canonical, since);
@@ -1663,9 +2018,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
+        let relisted = fsevents::changes_since(dev, &mount, &canonical, since);
         let (incr, save) = scan_cached(&dir, &Progress::default(), false);
         let save = save.unwrap();
-        assert!(matches!(save.how, How::Incremental { reused, .. } if reused > 0));
+        assert!(matches!(save.how, How::Incremental { reused, .. } if reused > 0), "{:?}; relisted (path, recursive): {relisted:?}", save.how);
         let full = scan(&dir, &Progress::default());
         assert_eq!(fingerprint(&incr), fingerprint(&full));
         assert_eq!((incr.errors, incr.cloud_only), (full.errors, full.cloud_only));
@@ -1681,6 +2037,38 @@ mod tests {
         assert_eq!(fingerprint(&incr), fingerprint(&scan(&dir, &Progress::default())));
         save.save(&incr);
         fs::remove_file(&link).unwrap();
+
+        // A clean folder's file gains its first extra link (1 -> 2), then loses it (2 -> 1).
+        // Only the new link's folder has an event; clean/n5 is reused.
+        since = cache::load(&dir, &fsevents::device_uuid(dev).unwrap(), onboarding::has_full_disk_access()).unwrap().header.event_id;
+        for (what, change) in [("1->2", true), ("2->1", false)] {
+            if change {
+                fs::create_dir_all(dir.join("new/l3")).unwrap();
+                fs::hard_link(dir.join("clean/n5/f"), dir.join("new/l3/first")).unwrap();
+            } else {
+                fs::remove_file(dir.join("new/l3/first")).unwrap();
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let changes = fsevents::changes_since(dev, &mount, &canonical, since);
+                let fsevents::Changes::Dirs(dirs) = &changes else { panic!("{what}: {changes:?}") };
+                if dirs.iter().any(|d| d.0 == Path::new("new/l3")) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "{what}: event never arrived: {dirs:?}");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            for round in ["after the event", "quiet"] {
+                let (incr, save) = scan_cached(&dir, &Progress::default(), false);
+                let save = save.unwrap();
+                assert!(matches!(save.how, How::Incremental { reused, .. } if reused > 0), "{what} {round}: {:?}", save.how);
+                let full = scan(&dir, &Progress::default());
+                assert_eq!(fingerprint(&incr), fingerprint(&full), "{what} {round}");
+                assert_eq!(incr.nodes[Tree::ROOT].size, full.nodes[Tree::ROOT].size, "{what} {round}");
+                save.save(&incr);
+            }
+            since = cache::load(&dir, &fsevents::device_uuid(dev).unwrap(), onboarding::has_full_disk_access()).unwrap().header.event_id;
+        }
 
         // Access changes: the event names only the parent. Each must converge to a full scan,
         // and stay converged on a quiet rescan from the saved result.
@@ -1732,6 +2120,7 @@ mod tests {
     #[test]
     #[ignore]
     fn clone_accounting_matches_apfs() {
+        let _guard = fs_heavy();
         use std::process::Command;
         let run = |cmd: &str, args: &[&str]| {
             let out = Command::new(cmd).args(args).output().unwrap();
