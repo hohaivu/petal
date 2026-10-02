@@ -57,6 +57,19 @@ impl LiveNode {
         *self.children.lock().unwrap() = LiveChildren::default();
     }
 
+    /// A correction to bytes already recorded here (`charge_links` moving a hard link's bytes).
+    pub fn adjust(&self, delta: i64) {
+        self.bytes.fetch_add(delta as u64, Ordering::Relaxed);
+    }
+
+    /// Mark every folder below this one final.
+    pub fn finish_below(&self) {
+        for child in self.children.lock().unwrap().list.iter() {
+            child.done.store(true, Ordering::Release);
+            child.finish_below();
+        }
+    }
+
     pub fn record(&self, bytes: u64, files: u64) {
         if bytes > 0 {
             self.bytes.fetch_add(bytes, Ordering::Relaxed);
