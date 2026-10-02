@@ -29,6 +29,25 @@ system-wide filesystem lock when it's warm.
 - *More threads, several processes, `searchfs` (catalog search), Spotlight.* No gain (the lock is
   system-wide), or slower than the parallel walk, or blind to most of the disk (Spotlight skips
   `~/Library`, hidden folders and system areas).
+- *Round 2 bundle (rejected and reverted): entry names as `SharedString`, a presized flatten Vec,
+  current-folder updates every 64th folder, and depth-gated skip/hotspot lookups.* The agreed keep
+  rule required reproducible `/System/Library` B/A ≤ 0.99 and B faster in ≥ 7/10 pairs, with no
+  reproducible median regression on `~/Library`.
+  Three independent baseline-vs-bundle re-checks on `/System/Library` gave B/A **1.018 (5/10)**,
+  **1.016 (3/10)** and **1.010 (3/10)**. All failed the keep rule, so steps 1–4 were reverted.
+  These rounds used `COUNT_TOLERANCE=0` and the default `TOLERANCE=1000000` bytes; each reported
+  files=297799, nodes=459670, bytes=28356595712. Exact counts did not require a byte-exact gate.
+  The isolated step-2 comparison (steps 1+2 vs step 1) gave 0.990 (6/10) at count tolerance 0 and
+  0.960 (3/10) at count tolerance 5; neither met the keep rule.
+  Secondary `~/Library` re-checks (`COUNT_TOLERANCE=10`): at the default byte tolerance, two rounds
+  aborted on byte drift; 0.532 (5/8) and 1.126 (3/8) came from overlapping runs and are invalid
+  performance evidence; 1.010 (3/8) completed at `TOLERANCE=200000000`, which alone does not
+  establish reproducible non-regression. The historical exact baseline-fingerprint check could not
+  be completed because the trees drifted; matching A/B counts within pairs is not that historical check.
+- *Walking one subfolder inline instead of as a rayon task.* Fan-out ≤ 1: 0.977 (6/10), 1.048 (5/10),
+  `~/Library` 1.038. Fan-out ≤ 2: 0.891 (8/10), 0.963 (4/10), 1.028 (3/10), 0.934 (8/10), `~/Library` 0.963.
+  Pairs won only 23/40: no consistent win.
+- *Parallelising flatten.* It is at most ~1% of scan time (45–68 ms of ~5 s on `~/Library`), so it isn't worth the complexity.
 - *Reading APFS clone information for every file during the scan.* 12–130% slower. Clone accounting
   moved off the scan path instead (see "Exact savings").
 
