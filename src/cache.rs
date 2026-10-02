@@ -14,11 +14,11 @@ use crate::scan::{Kind, Link, Mark, Node, ScanMeta, Tree};
 
 const MAGIC: &[u8; 8] = b"PETALSC1";
 /// Bump whenever scan semantics change.
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const TAG_FILE: u8 = 0;
 const TAG_DIR: u8 = 1;
 const TAG_MARKED: u8 = 0x80;
-/// A hard-linked file: dev, ino and the file's size follow its charged size.
+/// A hard-linked file: the file's size follows its identity.
 const TAG_LINK: u8 = 0x40;
 const FLAG_DATALESS: u8 = 1;
 
@@ -36,7 +36,9 @@ pub struct Cached {
     pub header: Header,
     /// Pre-order: node `ix`'s subtree is `ix..sub_end[ix]`.
     pub nodes: Vec<Node>,
+    /// Per node, as `ScanMeta::inos`: the inode.
     pub inos: Vec<u64>,
+    /// Per node, as `ScanMeta::stamps`: folders their stamp, files their device.
     pub stamps: Vec<u64>,
     /// Sorted by node index.
     pub marks: Vec<(usize, Mark)>,
@@ -105,9 +107,10 @@ pub fn encode(tree: &Tree, meta: &ScanMeta, header: &Header) -> Vec<u8> {
         put_bytes(&mut out, node.name.as_bytes());
         if node.kind == Kind::File {
             put_varint(&mut out, node.size);
+            // Identity: the inode, then the device (see `ScanMeta::stamps`).
+            put_varint(&mut out, meta.inos.get(ix).copied().unwrap_or(0));
+            put_varint(&mut out, meta.stamps.get(ix).copied().unwrap_or(0));
             if let Some(link) = link {
-                put_varint(&mut out, link.dev);
-                put_varint(&mut out, link.ino);
                 put_varint(&mut out, link.size);
             }
         } else {
@@ -179,12 +182,9 @@ pub fn decode(buf: &[u8]) -> Option<Cached> {
         if let Some(parent) = parent {
             nodes[parent].children.push(ix);
         }
-        let (size, items, ino) = if kind == Kind::File { (r.varint()?, 1, 0) } else { (0, 0, 0) };
-        if tag & TAG_LINK != 0 {
-            if kind != Kind::File {
-                return None;
-            }
-            links.push((ix, Link { dev: r.varint()?, ino: r.varint()?, size: r.varint()?, fresh: false }));
+        let (size, items) = if kind == Kind::File { (r.varint()?, 1) } else { (0, 0) };
+        if tag & TAG_LINK != 0 && kind != Kind::File {
+            return None;
         }
         nodes.push(Node { name: name.to_owned().into(), size, kind, parent, children: Vec::new(), items });
         if kind == Kind::Dir {
@@ -193,8 +193,12 @@ pub fn decode(buf: &[u8]) -> Option<Cached> {
             stamps.push(stamp);
             stack.push(Frame { ix, left, own });
         } else {
+            let (ino, dev) = (r.varint()?, r.varint()?);
+            if tag & TAG_LINK != 0 {
+                links.push((ix, Link { dev, ino, size: r.varint()?, fresh: false }));
+            }
             inos.push(ino);
-            stamps.push(0);
+            stamps.push(dev);
             sub_end[ix] = ix + 1;
         }
         if tag & TAG_MARKED != 0 {
