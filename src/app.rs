@@ -26,7 +26,7 @@ use crate::motion;
 use crate::scan::{self, Kind, Progress, Tree, Volume, format_count, format_size};
 use crate::sunburst::{self, Geometry, Hit, Segment, Target};
 
-actions!(petal, [GoUp, OpenFolder, Rescan, StartOver]);
+actions!(petal, [FullRescan, GoUp, OpenFolder, Rescan, StartOver]);
 
 const BG: u32 = 0x1c1d21;
 const PANEL: u32 = 0x232529;
@@ -365,7 +365,7 @@ impl Petal {
         #[cfg(feature = "snapshot")]
         crate::snapshot::install(window, cx);
         if let Some(path) = initial {
-            this.start_scan(path, cx);
+            this.start_scan(path, false, cx);
         }
         this
     }
@@ -447,7 +447,7 @@ impl Petal {
         )
     }
 
-    fn start_scan(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+    fn start_scan(&mut self, root: PathBuf, force_full: bool, cx: &mut Context<Self>) {
         self.error = None;
         onboarding::mark_first_run_done();
         let progress = Arc::new(Progress::default());
@@ -462,10 +462,13 @@ impl Petal {
                     .background_spawn({
                         let progress = progress.clone();
                         async move {
-                            let tree = scan::scan(&root, &progress);
+                            let (tree, save) = scan::scan_cached(&root, &progress, force_full);
                             // May survey clone sharing (e.g. pnpm's cloned node_modules), so
-                            // keep it off the UI thread.
-                            let findings = findings::from_tree(&tree, &findings::Bases::for_root(&tree.root_path));
+                            // keep it off the UI thread. The cache write overlaps it.
+                            let (findings, ()) = rayon::join(
+                                || findings::from_tree(&tree, &findings::Bases::for_root(&tree.root_path)),
+                                || if let Some(save) = save { save.save(&tree) },
+                            );
                             (tree, findings)
                         }
                     })
@@ -570,7 +573,7 @@ impl Petal {
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(mut paths))) = paths.await {
                 if let Some(path) = paths.pop() {
-                    this.update(cx, |this, cx| this.start_scan(path, cx)).ok();
+                    this.update(cx, |this, cx| this.start_scan(path, false, cx)).ok();
                 }
             }
         })
@@ -578,13 +581,21 @@ impl Petal {
     }
 
     fn rescan(&mut self, _: &Rescan, _: &mut Window, cx: &mut Context<Self>) {
+        self.restart_scan(false, cx);
+    }
+
+    fn full_rescan(&mut self, _: &FullRescan, _: &mut Window, cx: &mut Context<Self>) {
+        self.restart_scan(true, cx);
+    }
+
+    fn restart_scan(&mut self, force_full: bool, cx: &mut Context<Self>) {
         let root = match &self.screen {
             Screen::Results(r) => r.requested_root.clone(),
             Screen::Scanning(s) => s.root.clone(),
             Screen::Start(_) => return,
         };
         self.cancel_scan(cx);
-        self.start_scan(root, cx);
+        self.start_scan(root, force_full, cx);
     }
 
     fn start_over(&mut self, _: &StartOver, _: &mut Window, cx: &mut Context<Self>) {
@@ -805,6 +816,7 @@ impl Render for Petal {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::rescan))
+            .on_action(cx.listener(Self::full_rescan))
             .on_action(cx.listener(Self::start_over))
             .on_action(cx.listener(Self::go_up))
             .size_full()
@@ -1001,7 +1013,7 @@ impl Petal {
                     )
                     .child(
                         primary_button(("scan", i), "Scan", ACCENT)
-                            .on_click(cx.listener(move |this, _, _, cx| this.start_scan(path.clone(), cx))),
+                            .on_click(cx.listener(move |this, _, _, cx| this.start_scan(path.clone(), false, cx))),
                     ),
             );
         }
@@ -1031,7 +1043,7 @@ impl Petal {
                     .when_some(home, |el, home| {
                         el.child(
                             button("scan-home", "Scan Home Folder")
-                                .on_click(cx.listener(move |this, _, _, cx| this.start_scan(home.clone(), cx))),
+                                .on_click(cx.listener(move |this, _, _, cx| this.start_scan(home.clone(), false, cx))),
                         )
                     })
                     .child(

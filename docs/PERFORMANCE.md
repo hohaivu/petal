@@ -116,6 +116,25 @@ and link reporting on:
 throwaway APFS disk image (no admin needed), predicts what deleting each item frees, deletes it and
 measures. Prediction equals the space actually freed in every case.
 
+## Incremental rescans
+
+After a completed scan, Petal saves the tree to `~/Library/Caches/io.github.henrydennis.petal/scans/`
+(newest 3 roots) with the FSEvents event id taken *before* the scan started. On the next scan
+(launch, Open Folder, Rescan) it asks the volume's FSEvents history which folders changed since then,
+re-lists only those folders and their ancestors, and reuses every clean cached subtree as is. The
+result is identical to a full scan's. Rescanning `~/Library` (about 215k folders) takes about 0.2 s
+instead of 5–9 s.
+
+It falls back to a full scan when there's any doubt: external volumes (always full), no FSEvents
+history, no cache, a different device UUID or Full Disk Access state than when the cache was written,
+dropped or wrapped events, a remount, a must-rescan above the root, a 10 s history timeout, a replaced
+root, or hard links in a re-listed folder. File ▸ Full Rescan (⌘⇧R) forces a full scan. Folders that
+were unreadable are always re-listed, since granting access sends no event.
+
+`fsevents_incremental_end_to_end` is the gate. It changes a fixture, waits for the events, and
+checks that the incremental path was taken and matches a full scan exactly. `--bench-rescan` does
+the same on a real tree.
+
 ## Reproducing
 
 ```sh
@@ -123,9 +142,15 @@ cargo build --release
 ./target/release/petal --bench-scan ~/Library 6          # median of 6 headless scans
 ./target/release/petal --bench-live / 3                  # live-chart metrics (grant Full Disk Access for /)
 ./bench/ab.sh old/petal new/petal 8 ~/Library            # interleaved A/B with a result-fingerprint check
+./target/release/petal --bench-rescan ~/Library 3        # incremental vs full, with an equality gate
 cargo test                                               # unit tests
 cargo test -- --ignored                                  # plus the APFS disk-image test
 ```
 
 `bench/ab.sh` alternates the two binaries (flipping the order each round) so both see the same
 background load, and refuses to report a speed-up if the two results differ.
+
+`--bench-rescan` checks the two results for equality. On a live tree like `~/Library`, both scans see
+apps writing files, and hard links are charged to whichever link the parallel walk reaches first. So a
+MISMATCH there can be real drift: two full scans differ the same way. On a quiet tree (`/Applications`)
+it reports `gate ok`.

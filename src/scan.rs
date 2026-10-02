@@ -9,13 +9,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use gpui::SharedString;
 
+use crate::cache;
 use crate::disk::{self, DiskLayout};
 use crate::dirlist;
 use crate::findings;
+use crate::fsevents;
+use crate::onboarding;
 use crate::live::{LIVE_DEPTH, LiveNode};
 use rayon::prelude::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Dir,
     File,
@@ -139,6 +142,18 @@ pub struct Progress {
     /// Hotspot folders as they finish, with exact sizes.
     pub early_findings: Mutex<Vec<findings::Early>>,
     pub started: std::sync::OnceLock<std::time::Instant>,
+    /// Folders an incremental rescan took from the cache rather than listing (included in `dirs`).
+    pub reused_dirs: AtomicU64,
+}
+
+impl Progress {
+    /// Forget an abandoned incremental attempt before the full scan starts over.
+    fn reset_counts(&self) {
+        for counter in [&self.files, &self.bytes, &self.errors, &self.cloud_only, &self.dirs, &self.reused_dirs] {
+            counter.store(0, Ordering::Relaxed);
+        }
+        self.live.reset();
+    }
 }
 
 struct Raw {
@@ -427,7 +442,102 @@ impl<'a> Walker<'a> {
     }
 }
 
+/// A plain full scan, no cache I/O.
 pub fn scan(root: &Path, progress: &Progress) -> Tree {
+    scan_root(root, progress, |root, bases| scan_with_bases(root, progress, bases))
+}
+
+/// How `scan_cached` got its tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum How {
+    Incremental { relisted: u64, reused: u64 },
+    Full(&'static str),
+}
+
+/// A finished scan's cache, saved once the final tree is known.
+pub struct SaveCache {
+    meta: ScanMeta,
+    header: cache::Header,
+    pub how: How,
+}
+
+impl SaveCache {
+    pub fn save(&self, tree: &Tree) {
+        cache::save(tree, &self.meta, &self.header);
+    }
+}
+
+/// `scan`, but brought up to date from the cache when FSEvents can say what changed.
+/// Only on the startup disk's container: external volumes always scan in full.
+pub fn scan_cached(root: &Path, progress: &Progress, force_full: bool) -> (Tree, Option<SaveCache>) {
+    let mut save = None;
+    let tree = scan_root(root, progress, |root, bases| {
+        let (tree, s) = scan_cached_inner(root, progress, bases, force_full);
+        save = s;
+        tree
+    });
+    (tree, save)
+}
+
+fn scan_cached_inner(root: &Path, progress: &Progress, bases: &findings::Bases, force_full: bool) -> (Tree, Option<SaveCache>) {
+    let log = |how: &How| {
+        if std::env::var_os("PETAL_PHASES").is_some() {
+            match how {
+                How::Incremental { relisted, reused } => eprintln!("  incremental: {relisted} dirs re-listed, {reused} reused"),
+                How::Full(reason) => eprintln!("  full: {reason}"),
+            }
+        }
+    };
+    let internal = disk::container_at(root).is_some_and(|c| Some(c) == disk::container_at(Path::new("/")));
+    let meta = fs::symlink_metadata(root).ok();
+    let target = meta.filter(|_| internal).and_then(|m| Some((m.dev(), m.ino(), fsevents::device_uuid(m.dev())?)));
+    let Some((dev, root_ino, device_uuid)) = target else {
+        log(&How::Full(if internal { "no FSEvents history" } else { "external volume" }));
+        return (scan_with_bases(root, progress, bases), None);
+    };
+    // Before any listing: changes made during this scan get later ids, so the next one replays them.
+    let event_id = fsevents::current_id();
+    let has_fda = onboarding::has_full_disk_access();
+    let full = |reason| {
+        let (tree, meta) = scan_with_meta(root, progress, bases);
+        (tree, meta, How::Full(reason))
+    };
+    let (tree, meta, how) = 'scan: {
+        if force_full {
+            break 'scan full("forced");
+        }
+        let Some(cached) = cache::load(root, &device_uuid, has_fda) else { break 'scan full("no valid cache") };
+        let (Ok(canonical), Some(mount)) = (fs::canonicalize(root), mount_of(root)) else { break 'scan full("no mount point") };
+        let dirty = match fsevents::changes_since(dev, &mount, &canonical, cached.header.event_id) {
+            fsevents::Changes::Reset(reason) => break 'scan full(reason),
+            fsevents::Changes::Dirs(dirs) => dirs.into_iter().map(|(rel, recursive)| (root.join(rel), recursive)).collect::<Vec<_>>(),
+        };
+        match incremental::rescan(root, progress, cached, &dirty) {
+            Ok((tree, meta)) => {
+                let reused = progress.reused_dirs.load(Ordering::Relaxed);
+                let relisted = progress.dirs.load(Ordering::Relaxed) - reused;
+                (tree, meta, How::Incremental { relisted, reused })
+            }
+            Err(fallback) => {
+                progress.reset_counts();
+                full(match fallback {
+                    incremental::Fallback::Root => "root replaced",
+                    incremental::Fallback::HardLinks => "hard links on a changed path",
+                })
+            }
+        }
+    };
+    log(&how);
+    let save = (!progress.cancelled.load(Ordering::Relaxed)).then(|| SaveCache {
+        meta,
+        header: cache::Header { root: root.to_path_buf(), device_uuid, event_id, root_ino, has_fda },
+        how,
+    });
+    (tree, save)
+}
+
+/// The startup-disk handling shared by `scan` and `scan_cached`; `inner` scans one folder.
+fn scan_root(root: &Path, progress: &Progress, inner: impl FnOnce(&Path, &findings::Bases) -> Tree) -> Tree {
     let _ = progress.started.set(std::time::Instant::now());
     if root == Path::new("/") {
         if let Some(layout) = disk::startup_layout(startup_disk_name()) {
@@ -439,7 +549,7 @@ pub fn scan(root: &Path, progress: &Progress) -> Tree {
                 let _ = progress.expected_items.set(items);
             }
             let bases = findings::Bases::for_root(&layout.data_root);
-            let mut tree = scan_with_bases(&layout.data_root, progress, &bases);
+            let mut tree = inner(&layout.data_root, &bases);
             add_volume_slices(&mut tree, &layout);
             return tree;
         }
@@ -449,7 +559,7 @@ pub fn scan(root: &Path, progress: &Progress) -> Tree {
             let _ = progress.expected_items.set(items);
         }
     }
-    scan_with_bases(root, progress, &findings::Bases::for_root(root))
+    inner(root, &findings::Bases::for_root(root))
 }
 
 /// Files and folders in use on the volume mounted at `mount` (exact, from APFS).
@@ -558,8 +668,6 @@ fn resolve_marks(tree: &Tree, marks: Vec<(PathBuf, Mark)>) -> Vec<(usize, Mark)>
 }
 
 /// Incremental rescans from a cached tree.
-// ponytail: only the tests call this until wave 2 wires up FSEvents.
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod incremental {
     use super::*;
     use crate::cache::Cached;
@@ -767,6 +875,7 @@ pub mod incremental {
             // Folders "listed", as the progress bar counts them.
             self.progress.dirs.fetch_add(dirs - cloud_only, Ordering::Relaxed);
             self.progress.cloud_only.fetch_add(cloud_only, Ordering::Relaxed);
+            self.progress.reused_dirs.fetch_add(dirs - cloud_only, Ordering::Relaxed);
             seed_live(cached, ix, live, depth);
         }
     }
@@ -995,22 +1104,67 @@ pub fn bench(root: &Path, runs: usize) {
     println!("median {:.3}s  min {:.3}s  max {:.3}s", times[times.len() / 2], times[0], times[times.len() - 1]);
 }
 
+/// Time incremental rescans against full scans of `root`, checking they agree.
+pub fn bench_rescan(root: &Path, runs: usize) {
+    println!("(on a live tree, an occasional MISMATCH can be real changes between the two scans)");
+    let (tree, save) = scan_cached(root, &Progress::default(), true);
+    let Some(save) = save else {
+        println!("no FSEvents history for this volume (or it's external): every scan is full");
+        return;
+    };
+    save.save(&tree);
+    drop(tree);
+    for run in 0..runs {
+        let start = std::time::Instant::now();
+        let (incr, save) = scan_cached(root, &Progress::default(), false);
+        let incr_s = start.elapsed().as_secs_f64();
+        let start = std::time::Instant::now();
+        let full = scan(root, &Progress::default());
+        let full_s = start.elapsed().as_secs_f64();
+        let how = match save.as_ref().map(|s| s.how) {
+            Some(How::Incremental { relisted, reused }) => format!("{relisted} relisted, {reused} reused"),
+            Some(How::Full(reason)) => format!("fell back to full: {reason}"),
+            None => "not saved".into(),
+        };
+        if let Some(save) = save {
+            save.save(&incr);
+        }
+        let (a, b) = (incremental::fingerprint(&incr), incremental::fingerprint(&full));
+        let (sa, sb): (HashSet<_>, HashSet<_>) = (a.iter().collect(), b.iter().collect());
+        let differ = sa.symmetric_difference(&sb).count();
+        // Paths and item counts only: tells real drift (files coming and going) from size noise.
+        let structure = |f: &[(String, Kind, u64, u64)]| f.iter().map(|x| (x.0.clone(), x.1, x.3)).collect::<HashSet<_>>();
+        let structural = structure(&a).symmetric_difference(&structure(&b)).count();
+        let gate = if a == b && (incr.errors, incr.cloud_only) == (full.errors, full.cloud_only) {
+            "gate ok".to_string()
+        } else {
+            format!("MISMATCH ({differ} paths differ, {structural} in paths or item counts)")
+        };
+        println!("run {run}: incremental {incr_s:.3} s ({how}) full {full_s:.3} s {gate}");
+    }
+}
+
 /// Bytes in use on the volume, if `root` is the top of a volume (so a full scan of
 /// it should account for roughly that much).
 pub fn volume_used(root: &Path) -> Option<u64> {
+    if mount_of(root)? != root {
+        return None;
+    }
+    let (total, free) = statvfs(root)?;
+    Some(total.saturating_sub(free))
+}
+
+/// Where the volume holding `path` is mounted.
+fn mount_of(path: &Path) -> Option<PathBuf> {
     use std::ffi::{CStr, CString};
     use std::os::unix::ffi::OsStrExt;
-    let c_path = CString::new(root.as_os_str().as_bytes()).ok()?;
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
         return None;
     }
     let mount_point = unsafe { CStr::from_ptr(stat.f_mntonname.as_ptr()) };
-    if Path::new(std::ffi::OsStr::from_bytes(mount_point.to_bytes())) != root {
-        return None;
-    }
-    let (total, free) = statvfs(root)?;
-    Some(total.saturating_sub(free))
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(mount_point.to_bytes())))
 }
 
 pub fn display_name(path: &Path) -> String {
@@ -1359,6 +1513,58 @@ mod tests {
         assert_eq!(b.errors, 0);
         assert_eq!(fingerprint(&b), fingerprint(&c));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Real FSEvents history: a cached scan, then changes, then an incremental rescan
+    /// that must take the incremental path and match a full scan exactly.
+    #[test]
+    fn fsevents_incremental_end_to_end() {
+        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/target/petal-fsevents-test"));
+        let _ = fs::remove_dir_all(&dir);
+        write(&dir.join("keep/a/b/deep.bin"), 4096);
+        write(&dir.join("grow/g.bin"), 100);
+        write(&dir.join("del/sub/x"), 20000);
+        for i in 0..10 {
+            write(&dir.join(format!("clean/n{i}/f")), 100 * i);
+        }
+        let dev = fs::metadata(&dir).unwrap().dev();
+        if fsevents::device_uuid(dev).is_none() {
+            eprintln!("skipped: no FSEvents history on this volume");
+            return;
+        }
+        // SAFETY: the only test that reads PETAL_CACHE_DIR.
+        unsafe { std::env::set_var("PETAL_CACHE_DIR", dir.with_extension("cache")) };
+        let (tree, save) = scan_cached(&dir, &Progress::default(), true);
+        let save = save.expect("internal volume with history");
+        assert_eq!(save.how, How::Full("forced"));
+        save.save(&tree);
+        let since = cache::load(&dir, &fsevents::device_uuid(dev).unwrap(), onboarding::has_full_disk_access()).unwrap().header.event_id;
+
+        write(&dir.join("grow/g.bin"), 300000);
+        fs::remove_dir_all(dir.join("del/sub")).unwrap();
+        write(&dir.join("new/l1/f"), 12345);
+        write(&dir.join("keep/a/b/deep.bin"), 200000);
+        // Test-only: wait for fseventsd to have the changes on record.
+        let (canonical, mount) = (fs::canonicalize(&dir).unwrap(), mount_of(&dir).unwrap());
+        let wanted = ["grow", "del", "new/l1", "keep/a/b"].map(PathBuf::from);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let changes = fsevents::changes_since(dev, &mount, &canonical, since);
+            let fsevents::Changes::Dirs(dirs) = &changes else { panic!("{changes:?}") };
+            if wanted.iter().all(|w| dirs.iter().any(|d| &d.0 == w)) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "events never arrived: {dirs:?}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        let (incr, save) = scan_cached(&dir, &Progress::default(), false);
+        assert!(matches!(save.unwrap().how, How::Incremental { reused, .. } if reused > 0));
+        let full = scan(&dir, &Progress::default());
+        assert_eq!(fingerprint(&incr), fingerprint(&full));
+        assert_eq!((incr.errors, incr.cloud_only), (full.errors, full.cloud_only));
+        fs::remove_dir_all(&dir).unwrap();
+        let _ = fs::remove_dir_all(dir.with_extension("cache"));
     }
 
     #[test]

@@ -5,9 +5,6 @@
 //! subtree decodes to a contiguous index range. Folder sizes and item counts are
 //! recomputed on decode; only a folder's own allocation is stored.
 
-// ponytail: only the tests use this until wave 2 wires up load/save.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::fs;
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -193,6 +190,52 @@ pub fn decode(buf: &[u8]) -> Option<Cached> {
     }
     let header = Header { root, device_uuid, event_id, root_ino, has_fda };
     Some(Cached { header, nodes, inos, marks, sub_end })
+}
+
+/// Bundle id, so the unbundled binary shares the app's cache.
+const BUNDLE_ID: &str = "io.github.henrydennis.petal";
+/// Caches kept, newest first.
+// ponytail: fixed count; size-based budget if users scan many roots.
+const KEEP: usize = 3;
+
+/// `PETAL_CACHE_DIR` overrides it (for tests).
+fn dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("PETAL_CACHE_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Caches").join(BUNDLE_ID).join("scans"))
+}
+
+fn file_for(root: &Path) -> Option<PathBuf> {
+    Some(dir()?.join(format!("{:016x}.bin", fnv1a(root.as_os_str().as_bytes()))))
+}
+
+/// Save and prune to the newest `KEEP`. Errors are ignored: it's only a cache.
+pub fn save(tree: &Tree, meta: &ScanMeta, header: &Header) {
+    let Some(file) = file_for(&header.root) else { return };
+    let Some(dir) = file.parent() else { return };
+    let _ = fs::create_dir_all(dir);
+    if write_atomic(&file, &encode(tree, meta, header)).is_err() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let mut bins: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "bin"))
+        .filter_map(|p| Some((fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .collect();
+    bins.sort_by_key(|b| std::cmp::Reverse(b.0));
+    for (_, old) in bins.into_iter().skip(KEEP) {
+        let _ = fs::remove_file(old);
+    }
+}
+
+/// The cache for `root`, if it's still valid for this volume history and access level.
+pub fn load(root: &Path, device_uuid: &str, has_fda: bool) -> Option<Cached> {
+    let cached = decode(&fs::read(file_for(root)?).ok()?)?;
+    let h = &cached.header;
+    (h.root == root && h.device_uuid == device_uuid && h.has_fda == has_fda).then_some(cached)
 }
 
 /// Write via a temp file and `rename`, so a crash never leaves a half-written cache.

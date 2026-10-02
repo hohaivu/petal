@@ -49,6 +49,14 @@ impl LiveNode {
         child
     }
 
+    /// Back to empty, as if nothing had been recorded.
+    pub fn reset(&self) {
+        self.bytes.store(0, Ordering::Relaxed);
+        self.files.store(0, Ordering::Relaxed);
+        self.done.store(false, Ordering::Relaxed);
+        *self.children.lock().unwrap() = LiveChildren::default();
+    }
+
     pub fn record(&self, bytes: u64, files: u64) {
         if bytes > 0 {
             self.bytes.fetch_add(bytes, Ordering::Relaxed);
