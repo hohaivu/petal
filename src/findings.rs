@@ -2,6 +2,7 @@
 //! explanation of whether they're safe to delete. The hotspot pass scans these first, so
 //! their sizes are exact within seconds of starting a scan.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::scan::{Kind, Tree};
@@ -66,6 +67,55 @@ const FLUTTER_ARTIFACTS: &[&str] = &[
     "ios/Pods", "macos/Pods", "ios/.symlinks", "macos/.symlinks", "android/.gradle",
 ];
 
+/// Signed packages macOS treats as one item: removing anything inside breaks the app or
+/// its code signature, wherever the bundle lives.
+// ponytail: extension list only; check LSItemIsPackage / kMDItemContentTypeTree if unknown
+// bundle types ever matter.
+const BUNDLES: &[&str] = &[
+    "app", "appex", "bundle", "framework", "plugin", "xpc", "kext", "systemextension",
+    "prefPane", "qlgenerator", "mdimporter", "saver",
+];
+
+/// Owned by macOS, installers or package managers (global npm in /usr/local and
+/// /opt/homebrew), relative to the volume root. Not /private: temp dirs live there.
+const SYSTEM_OWNED: &[&str] = &["Applications", "Library", "System", "usr", "opt"];
+
+/// Owned by apps, version managers and editors (their own node_modules), relative to home.
+/// No blanket ~/.* rule: dev worktrees can live in hidden folders.
+const HOME_OWNED: &[&str] = &[
+    "Library", "Applications", ".nvm", ".volta", ".asdf", ".bun", ".local", ".vscode",
+    ".vscode-insiders", ".cursor",
+];
+
+fn is_bundle(name: &OsStr) -> bool {
+    Path::new(name).extension().is_some_and(|e| BUNDLES.iter().any(|b| e.eq_ignore_ascii_case(b)))
+}
+
+/// Never offered as a dynamic finding: inside a bundle, or in a system- or tool-owned folder.
+pub fn protected(path: &Path, bases: &Bases) -> bool {
+    if path.components().any(|c| is_bundle(c.as_os_str())) {
+        return true;
+    }
+    let volume = match path.strip_prefix("/System/Volumes/Data") {
+        Ok(rest) => Path::new("/").join(rest),
+        Err(_) => path.to_path_buf(),
+    };
+    if SYSTEM_OWNED.iter().any(|r| volume.starts_with(Path::new("/").join(r))) {
+        return true;
+    }
+    bases.home.as_ref().is_some_and(|home| HOME_OWNED.iter().any(|r| path.starts_with(home.join(r))))
+}
+
+/// Strictly inside a bundle: deleting it would break the app. The whole bundle is fine.
+pub fn inside_bundle(path: &Path) -> bool {
+    path.parent().is_some_and(|p| p.components().any(|c| is_bundle(c.as_os_str())))
+}
+
+/// Cheap prefilter: a protected subtree's top folder always has one of these names.
+fn may_protect(name: &str) -> bool {
+    is_bundle(OsStr::new(name)) || SYSTEM_OWNED.contains(&name) || HOME_OWNED.contains(&name)
+}
+
 #[derive(Clone, Debug)]
 pub struct Finding {
     pub title: &'static str,
@@ -120,7 +170,7 @@ pub fn from_tree(tree: &Tree, bases: &Bases) -> Vec<Finding> {
     from_tree_min(tree, bases, MIN_SIZE)
 }
 
-fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
+pub(crate) fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
     let mut findings = Vec::new();
     {
         for category in CATALOG {
@@ -147,7 +197,7 @@ fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
     let mut flutter = Vec::new();
     let mut projects = 0;
     let mut flagged = std::collections::HashSet::new();
-    let mut stack = vec![Tree::ROOT];
+    let mut stack = if protected(&tree.root_path, bases) { Vec::new() } else { vec![Tree::ROOT] };
     while let Some(ix) = stack.pop() {
         let children = &tree.nodes[ix].children;
         if children.iter().any(|&c| tree.nodes[c].kind == Kind::File && tree.nodes[c].name.as_ref() == "pubspec.yaml") {
@@ -166,6 +216,11 @@ fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
         for &child in &tree.nodes[ix].children {
             let node = &tree.nodes[child];
             if node.kind != Kind::Dir {
+                continue;
+            }
+            // ponytail: the top folder of any protected subtree carries a bundle or owned-root
+            // name, so the full path is built only for those few; the DFS stays index-only.
+            if may_protect(&node.name) && protected(&tree.path_of(child), bases) {
                 continue;
             }
             if node.name.as_ref() == "node_modules" {
@@ -357,5 +412,82 @@ mod tests {
         let findings = from_tree_min(&tree, &Bases::default(), 1);
         assert!(findings.iter().all(|f| f.title != "Flutter/Dart build files"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn never_flags_artifacts_in_bundles_or_owned_locations() {
+        let _guard = crate::scan::fs_heavy();
+        let dir = std::env::temp_dir().join(format!("petal-protected-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        write(&home.join("code/app/node_modules/a/index.js"), 10_000);
+        for p in [
+            "Applications/Foo.app/Contents/Resources/app/node_modules/x",
+            "Applications/Foo.app/Contents/Resources/proj/pubspec.yaml",
+            "Applications/Foo.app/Contents/Resources/proj/.dart_tool/x",
+        ] {
+            write(&dir.join(p), 10_000);
+        }
+        for p in [
+            "Downloads/Bar.APP/Contents/Resources/app.asar.unpacked/node_modules/x",
+            "code/Kit.framework/Versions/A/Resources/node_modules/x",
+            "Library/Application Support/Adobe/CEP/extensions/e/node_modules/x",
+            ".nvm/versions/node/v20/lib/node_modules/npm/x",
+            ".vscode/extensions/ext/node_modules/x",
+            "code/flut/pubspec.yaml",
+            "code/flut/.dart_tool/x",
+        ] {
+            write(&home.join(p), 10_000);
+        }
+        let tree = scan(&dir, &Progress::default());
+        let findings = from_tree_min(&tree, &Bases { home: Some(home.clone()), user_temp: None }, 0);
+        let nodes = |title: &str| -> std::collections::HashSet<PathBuf> {
+            findings.iter().find(|f| f.title == title).expect(title).nodes.iter().map(|&n| tree.path_of(n)).collect()
+        };
+        assert_eq!(nodes("node_modules"), [home.join("code/app/node_modules")].into());
+        assert_eq!(nodes("Flutter/Dart build files"), [home.join("code/flut/.dart_tool")].into());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn protected_scan_root_flags_nothing() {
+        let _guard = crate::scan::fs_heavy();
+        let dir = std::env::temp_dir().join(format!("petal-protected-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir.join("Foo.app/Contents/Resources/app/node_modules/x"), 10_000);
+        let tree = scan(&dir.join("Foo.app/Contents"), &Progress::default());
+        let findings = from_tree_min(&tree, &Bases::default(), 1);
+        assert!(findings.iter().all(|f| f.title != "node_modules"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn protected_paths() {
+        let disk = Bases { home: Some("/System/Volumes/Data/Users/me".into()), user_temp: None };
+        let folder = Bases { home: Some("/Users/me".into()), user_temp: None };
+        for p in [
+            "/System/Volumes/Data/Applications/Foo.app/Contents/Resources/app/node_modules",
+            "/Applications/Slack.app/Contents/Resources/app/node_modules",
+            "/opt/homebrew/lib/node_modules",
+            "/System/Volumes/Data/opt/homebrew/lib/node_modules",
+            "/usr/local/lib/node_modules",
+            "/Library/Application Support/x/node_modules",
+            "/Users/me/.nvm/x",
+            "/Users/me/Library/x",
+            "/Volumes/Ext/Foo.APP/Contents/x",
+        ] {
+            assert!(protected(Path::new(p), &folder), "{p}");
+        }
+        assert!(protected(Path::new("/System/Volumes/Data/Users/me/Library/x"), &disk));
+        for p in [
+            "/Users/me/code/game/Library/node_modules",
+            "/Users/me/.bb/worktrees/p/node_modules",
+            "/private/var/folders/ab/T/p/node_modules",
+        ] {
+            assert!(!protected(Path::new(p), &folder), "{p}");
+        }
+        assert!(!protected(Path::new("/System/Volumes/Data/Users/me/code/x/node_modules"), &disk));
+        assert!(!inside_bundle(Path::new("/Applications/Foo.app")));
+        assert!(inside_bundle(Path::new("/Applications/Foo.app/Contents")));
     }
 }

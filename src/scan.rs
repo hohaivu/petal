@@ -1583,6 +1583,23 @@ mod tests {
     }
 
     #[test]
+    fn incremental_never_flags_bundle_artifacts() {
+        let _guard = fs_heavy();
+        let dir = std::env::temp_dir().join(format!("petal-incr-bundle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write(&dir.join("proj/node_modules/a"), 5000);
+        let dir = fs::canonicalize(&dir).unwrap();
+        let (a, meta) = full(&dir);
+        write(&dir.join("Foo.app/Contents/Resources/app/node_modules/x"), 5000);
+        let (tree, _) = rescan(&dir, cache_of(&a, &meta), &[""]).0.unwrap();
+        let findings = findings::from_tree_min(&tree, &findings::Bases::default(), 0);
+        let modules = findings.iter().find(|f| f.title == "node_modules").unwrap();
+        let got: std::collections::HashSet<PathBuf> = modules.nodes.iter().map(|&n| tree.path_of(n)).collect();
+        assert_eq!(got, [dir.join("proj/node_modules")].into());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn cache_round_trips() {
         let _guard = fs_heavy();
         let dir = std::env::temp_dir().join(format!("petal-cache-{}", std::process::id()));
