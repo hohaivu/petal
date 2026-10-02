@@ -1476,6 +1476,7 @@ mod tests {
         for i in 0..20 {
             write(&dir.join(format!("clean/n{i}/f")), 100 * i);
         }
+        let dir = fs::canonicalize(&dir).unwrap();
         let (a, meta) = full(&dir);
         let cached = cache_of(&a, &meta);
 
