@@ -746,6 +746,12 @@ impl Petal {
         }
         let items = r.collector.clone();
         let paths: Vec<PathBuf> = items.iter().map(|&ix| r.tree.path_of(ix)).collect();
+        if let Some(p) = paths.iter().find(|p| crate::findings::inside_bundle(p)) {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            self.error = Some(format!("Petal won’t delete inside apps: “{name}” is part of an app bundle"));
+            cx.notify();
+            return;
+        }
         let message = if items.len() == 1 {
             format!("Move “{}” to the Trash?", r.tree.nodes[items[0]].name)
         } else {
