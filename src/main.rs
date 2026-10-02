@@ -1,9 +1,11 @@
 mod app;
+mod cache;
 mod clock;
 mod dirlist;
 mod disk;
 mod eta;
 mod findings;
+mod fsevents;
 mod live;
 mod motion;
 mod onboarding;
@@ -19,7 +21,7 @@ use gpui::{
     point, prelude::*, px, size,
 };
 
-use app::{GoUp, OpenFolder, Petal, Rescan, StartOver};
+use app::{FullRescan, GoUp, OpenFolder, Petal, Rescan, StartOver};
 
 actions!(petal, [Quit]);
 
@@ -31,6 +33,15 @@ fn main() {
         let path = PathBuf::from(args.get(2).expect("path required"));
         let runs = args.get(3).and_then(|r| r.parse().ok()).unwrap_or(5);
         scan::bench(&path, runs);
+        return;
+    }
+    // Headless incremental benchmark: `petal --bench-rescan <path> [runs]`
+    if args.get(1).map(String::as_str) == Some("--bench-rescan") {
+        let path = PathBuf::from(args.get(2).expect("path required"));
+        let runs = args.get(3).and_then(|r| r.parse().ok()).unwrap_or(3);
+        if !scan::bench_rescan(&path, runs) {
+            std::process::exit(1);
+        }
         return;
     }
     // Diagnostic: does this process have Full Disk Access? (Launch through `open` to ask
@@ -55,6 +66,7 @@ fn main() {
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-o", OpenFolder, None),
             KeyBinding::new("cmd-r", Rescan, None),
+            KeyBinding::new("cmd-shift-r", FullRescan, None),
             KeyBinding::new("cmd-up", GoUp, None),
             KeyBinding::new("backspace", GoUp, None),
             KeyBinding::new("escape", GoUp, None),
@@ -71,6 +83,7 @@ fn main() {
                 items: vec![
                     MenuItem::action("Open Folder…", OpenFolder),
                     MenuItem::action("Rescan", Rescan),
+                    MenuItem::action("Full Rescan", FullRescan),
                     MenuItem::separator(),
                     MenuItem::action("Show Disks", StartOver),
                 ],
