@@ -1476,7 +1476,6 @@ mod tests {
         for i in 0..20 {
             write(&dir.join(format!("clean/n{i}/f")), 100 * i);
         }
-        let dir = fs::canonicalize(&dir).unwrap();
         let (a, meta) = full(&dir);
         let cached = cache_of(&a, &meta);
 
@@ -1632,6 +1631,7 @@ mod tests {
         for i in 0..10 {
             write(&dir.join(format!("clean/n{i}/f")), 100 * i);
         }
+        let dir = fs::canonicalize(&dir).unwrap();
         let dev = fs::metadata(&dir).unwrap().dev();
         if fsevents::device_uuid(dev).is_none() {
             eprintln!("skipped: no FSEvents history on this volume");
