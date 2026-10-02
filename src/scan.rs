@@ -1977,7 +1977,25 @@ mod tests {
         let save = save.expect("internal volume with history");
         assert_eq!(save.how, How::Full("forced"));
         save.save(&tree);
-        let since = cache::load(&dir, &fsevents::device_uuid(dev).unwrap(), onboarding::has_full_disk_access()).unwrap().header.event_id;
+        let (canonical, mount) = (fs::canonicalize(&dir).unwrap(), mount_of(&dir).unwrap());
+        let mut since = cache::load(&dir, &fsevents::device_uuid(dev).unwrap(), onboarding::has_full_disk_access()).unwrap().header.event_id;
+        // Test-only warm-up: the fixture's own creation events can still land after the seed's
+        // watermark. Rescan (each must match the seed) until a replay relists at most the root.
+        let seed = (fingerprint(&tree), tree.errors, tree.cloud_only);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let changes = fsevents::changes_since(dev, &mount, &canonical, since);
+            let fsevents::Changes::Dirs(dirs) = &changes else { panic!("warm-up: {changes:?}") };
+            if dirs.iter().all(|d| d.0.as_os_str().is_empty()) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "fixture history never settled; still relisted (path, recursive): {dirs:?}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (warm, save) = scan_cached(&dir, &Progress::default(), false);
+            assert!((fingerprint(&warm), warm.errors, warm.cloud_only) == seed, "warm-up tree differs from the seed");
+            save.expect("internal volume with history").save(&warm);
+            since = cache::load(&dir, &fsevents::device_uuid(dev).unwrap(), onboarding::has_full_disk_access()).unwrap().header.event_id;
+        }
 
         write(&dir.join("grow/g.bin"), 300000);
         fs::remove_dir_all(dir.join("del/sub")).unwrap();
@@ -1988,7 +2006,6 @@ mod tests {
         fs::create_dir_all(dir.join("new/l2")).unwrap();
         fs::hard_link(dir.join("grow/linked"), dir.join("new/l2/link")).unwrap();
         // Test-only: wait for fseventsd to have the changes on record.
-        let (canonical, mount) = (fs::canonicalize(&dir).unwrap(), mount_of(&dir).unwrap());
         let wanted = ["grow", "del", "new/l1", "new/l2", "keep/a/b"].map(PathBuf::from);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -2001,9 +2018,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
+        let relisted = fsevents::changes_since(dev, &mount, &canonical, since);
         let (incr, save) = scan_cached(&dir, &Progress::default(), false);
         let save = save.unwrap();
-        assert!(matches!(save.how, How::Incremental { reused, .. } if reused > 0));
+        assert!(matches!(save.how, How::Incremental { reused, .. } if reused > 0), "{:?}; relisted (path, recursive): {relisted:?}", save.how);
         let full = scan(&dir, &Progress::default());
         assert_eq!(fingerprint(&incr), fingerprint(&full));
         assert_eq!((incr.errors, incr.cloud_only), (full.errors, full.cloud_only));
@@ -2022,7 +2040,7 @@ mod tests {
 
         // A clean folder's file gains its first extra link (1 -> 2), then loses it (2 -> 1).
         // Only the new link's folder has an event; clean/n5 is reused.
-        let mut since = cache::load(&dir, &fsevents::device_uuid(dev).unwrap(), onboarding::has_full_disk_access()).unwrap().header.event_id;
+        since = cache::load(&dir, &fsevents::device_uuid(dev).unwrap(), onboarding::has_full_disk_access()).unwrap().header.event_id;
         for (what, change) in [("1->2", true), ("2->1", false)] {
             if change {
                 fs::create_dir_all(dir.join("new/l3")).unwrap();
