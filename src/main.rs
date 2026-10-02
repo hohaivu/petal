@@ -1,4 +1,5 @@
 mod app;
+mod cache;
 mod clock;
 mod dirlist;
 mod disk;

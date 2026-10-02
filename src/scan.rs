@@ -146,7 +146,28 @@ struct Raw {
     size: u64,
     kind: Kind,
     items: u64,
+    /// Folders only (0 for files).
+    ino: u64,
     children: Vec<Raw>,
+}
+
+/// Rare per-folder facts an incremental rescan needs to know about the cached tree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Mark {
+    /// Failed opens and listing errors this folder contributed.
+    pub errors: u64,
+    /// Skipped as cloud-only.
+    pub dataless: bool,
+    /// Its listing had a file with more than one link.
+    pub hardlinks: bool,
+}
+
+/// What a full scan learns beyond the `Tree`, kept out of it so UI trees don't pay for it.
+pub struct ScanMeta {
+    /// Per node; 0 for files.
+    pub inos: Vec<u64>,
+    /// Sorted by node index.
+    pub marks: Vec<(usize, Mark)>,
 }
 
 struct Walker<'a> {
@@ -160,6 +181,9 @@ struct Walker<'a> {
     /// Read-only copy of the prescanned paths, so the main walk can check membership
     /// without taking a lock for every folder.
     prescanned_paths: HashSet<PathBuf>,
+    marks: Mutex<Vec<(PathBuf, Mark)>>,
+    /// Any listed folder had a hard-linked file.
+    saw_hardlink: AtomicBool,
 }
 
 /// Allocated size on disk, which is what actually frees up when a file is deleted.
@@ -167,10 +191,42 @@ fn disk_size(meta: &fs::Metadata) -> u64 {
     meta.blocks() * 512
 }
 
-impl Walker<'_> {
+impl<'a> Walker<'a> {
+    fn new(root: &Path, progress: &'a Progress) -> (Self, Option<fs::Metadata>) {
+        let root_meta = fs::symlink_metadata(root).ok();
+        let mut allowed_devices: HashSet<u64> = root_meta.iter().map(|m| m.dev()).collect();
+        let mut skip: HashSet<PathBuf> = ["/dev", "/Volumes", "/System/Volumes", "/net", "/home"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        skip.remove(root);
+
+        // On macOS, `/` is a sealed system volume whose user data lives on a separate
+        // APFS volume that is stitched in with firmlinks (e.g. /Users, /Applications).
+        if root == Path::new("/") {
+            if let Ok(data) = fs::metadata("/System/Volumes/Data") {
+                allowed_devices.insert(data.dev());
+            }
+        }
+        let walker = Walker {
+            progress,
+            allowed_devices,
+            skip,
+            hardlinks: Mutex::new(HashSet::new()),
+            prescanned: Mutex::new(HashMap::new()),
+            prescanned_paths: HashSet::new(),
+            marks: Mutex::new(Vec::new()),
+            saw_hardlink: AtomicBool::new(false),
+        };
+        (walker, root_meta)
+    }
+
+    fn admits(&self, path: &Path, entry: &dirlist::Entry) -> bool {
+        !self.skip.contains(path) && self.allowed_devices.contains(&entry.dev)
+    }
 
     fn admissible_dir(&self, path: &Path, entry: &dirlist::Entry) -> bool {
-        entry.is_dir && !entry.dataless && !self.skip.contains(path) && self.allowed_devices.contains(&entry.dev)
+        entry.is_dir && !entry.dataless && self.admits(path, entry)
     }
 
     /// Outline pass: list the top `depth_left` levels breadth-first so every folder there
@@ -210,7 +266,8 @@ impl Walker<'_> {
                 // Read the folder's own allocation now (the same attribute its parent's listing
                 // reports), so its total is exact, and final, as soon as this pass ends.
                 let own = dirlist::dir_alloc(path).unwrap_or(0);
-                let raw = self.walk_dir(None, path, display_name(path), own, &live, depth);
+                // `walk_subdir` fills in the inode when it splices this in.
+                let raw = self.walk_dir(None, path, display_name(path), 0, own, &live, depth);
                 if depth <= LIVE_DEPTH {
                     live.done.store(true, Ordering::Release);
                 }
@@ -227,29 +284,27 @@ impl Walker<'_> {
         self.prescanned.lock().unwrap().extend(results);
     }
 
-    /// `live` is this directory's own live node if it is within `LIVE_DEPTH`, else its
-    /// nearest live ancestor's.
-    fn walk_dir(
+    /// One folder's listing, shared by the full walk and `rescan`: opened relative to
+    /// `parent` (full-path fallback), its files tallied in listing order, its subfolders
+    /// left to the caller.
+    fn read(
         &self,
         parent: Option<&dirlist::Dir>,
         path: &Path,
-        name: String,
+        name: &str,
         own: u64,
         live: &LiveNode,
-        depth: usize,
-    ) -> Raw {
-        if self.progress.cancelled.load(Ordering::Relaxed) {
-            return Raw { name, size: 0, kind: Kind::Dir, items: 0, children: Vec::new() };
-        }
+    ) -> (Option<dirlist::Dir>, Vec<Raw>, Vec<dirlist::Entry>) {
         crate::clock::gate();
         if let Ok(mut current) = self.progress.current.try_lock() {
             *current = path.to_string_lossy().into_owned();
         }
         self.progress.dirs.fetch_add(1, Ordering::Relaxed);
 
+        let mut mark = Mark::default();
         // Relative open is the fast path; fall back to the full path (e.g. on EMFILE).
         let dir = match parent {
-            Some(parent) => parent.open_at(&name).or_else(|_| dirlist::Dir::open(path)),
+            Some(parent) => parent.open_at(name).or_else(|_| dirlist::Dir::open(path)),
             None => dirlist::Dir::open(path),
         };
         let listing = dir.and_then(|dir| dir.list(path, false).map(|listing| (dir, listing)));
@@ -257,37 +312,67 @@ impl Walker<'_> {
             Ok((dir, listing)) => {
                 if listing.errors > 0 {
                     self.progress.errors.fetch_add(listing.errors, Ordering::Relaxed);
+                    mark.errors = listing.errors;
                 }
                 (Some(dir), listing.entries)
             }
             Err(_) => {
                 self.progress.errors.fetch_add(1, Ordering::Relaxed);
+                mark.errors = 1;
                 (None, Vec::new())
             }
         };
 
         // Files are cheap: tally them inline and publish progress once per directory.
         // Only subdirectories become parallel tasks.
-        let mut children: Vec<Raw> = Vec::with_capacity(entries.len());
+        let mut files: Vec<Raw> = Vec::with_capacity(entries.len());
         let mut subdirs = Vec::new();
-        let (mut files, mut bytes) = (0u64, 0u64);
+        let (mut count, mut bytes) = (0u64, 0u64);
         for entry in entries {
             if entry.is_dir {
                 subdirs.push(entry);
                 continue;
             }
             let mut size = entry.size;
-            if entry.nlink > 1 && !self.hardlinks.lock().unwrap().insert((entry.dev, entry.ino)) {
-                size = 0;
+            if entry.nlink > 1 {
+                mark.hardlinks = true;
+                if !self.hardlinks.lock().unwrap().insert((entry.dev, entry.ino)) {
+                    size = 0;
+                }
             }
-            files += 1;
+            count += 1;
             bytes += size;
-            children.push(Raw { name: entry.name, size, kind: Kind::File, items: 1, children: Vec::new() });
+            files.push(Raw { name: entry.name, size, kind: Kind::File, items: 1, ino: 0, children: Vec::new() });
         }
-        self.progress.files.fetch_add(files, Ordering::Relaxed);
+        self.progress.files.fetch_add(count, Ordering::Relaxed);
         self.progress.bytes.fetch_add(bytes, Ordering::Relaxed);
-        live.record(own + bytes, files);
+        live.record(own + bytes, count);
+        if mark != Mark::default() {
+            if mark.hardlinks {
+                self.saw_hardlink.store(true, Ordering::Relaxed);
+            }
+            self.marks.lock().unwrap().push((path.to_path_buf(), mark));
+        }
+        (dir, files, subdirs)
+    }
 
+    /// `live` is this directory's own live node if it is within `LIVE_DEPTH`, else its
+    /// nearest live ancestor's.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_dir(
+        &self,
+        parent: Option<&dirlist::Dir>,
+        path: &Path,
+        name: String,
+        ino: u64,
+        own: u64,
+        live: &LiveNode,
+        depth: usize,
+    ) -> Raw {
+        if self.progress.cancelled.load(Ordering::Relaxed) {
+            return Raw { name, size: 0, kind: Kind::Dir, items: 0, ino, children: Vec::new() };
+        }
+        let (dir, mut children, subdirs) = self.read(parent, path, &name, own, live);
         let subdir_results: Vec<Raw> = subdirs
             .into_par_iter()
             .filter_map(|entry| self.walk_subdir(dir.as_ref(), path, entry, live, depth + 1))
@@ -298,7 +383,7 @@ impl Walker<'_> {
 
         let size = own + children.iter().map(|c| c.size).sum::<u64>();
         let items = children.iter().map(|c| c.items).sum();
-        Raw { name, size, kind: Kind::Dir, items, children }
+        Raw { name, size, kind: Kind::Dir, items, ino, children }
     }
 
     fn walk_subdir(
@@ -310,13 +395,14 @@ impl Walker<'_> {
         depth: usize,
     ) -> Option<Raw> {
         let path = parent.join(&entry.name);
-        if self.skip.contains(&path) || !self.allowed_devices.contains(&entry.dev) {
+        if !self.admits(&path, &entry) {
             return None;
         }
         let own_live = (depth <= LIVE_DEPTH).then(|| parent_live.child(&entry.name));
         let live = own_live.as_deref().unwrap_or(parent_live);
         if self.prescanned_paths.contains(&path) {
-            if let Some(raw) = self.prescanned.lock().unwrap().remove(&path) {
+            if let Some(mut raw) = self.prescanned.lock().unwrap().remove(&path) {
+                raw.ino = entry.ino;
                 return Some(raw);
             }
         }
@@ -324,13 +410,14 @@ impl Walker<'_> {
             // Its contents live in the cloud and take no space here; don't make macOS fetch them.
             self.progress.cloud_only.fetch_add(1, Ordering::Relaxed);
             live.record(entry.size, 0);
+            self.marks.lock().unwrap().push((path, Mark { dataless: true, ..Mark::default() }));
             // Only the folder's own node is final; `live` may be an ancestor's node here.
             if let Some(own) = &own_live {
                 own.done.store(true, Ordering::Release);
             }
-            return Some(Raw { name: entry.name, size: entry.size, kind: Kind::Dir, items: 0, children: Vec::new() });
+            return Some(Raw { name: entry.name, size: entry.size, kind: Kind::Dir, items: 0, ino: entry.ino, children: Vec::new() });
         }
-        let raw = self.walk_dir(dir, &path, entry.name, entry.size, live, depth);
+        let raw = self.walk_dir(dir, &path, entry.name, entry.ino, entry.size, live, depth);
         if let Some(own) = &own_live {
             if !self.progress.cancelled.load(Ordering::Relaxed) {
                 own.done.store(true, Ordering::Release);
@@ -426,31 +513,13 @@ pub fn startup_disk_name() -> String {
 
 /// `bases` locate the hotspot folders (none: no hotspot pass).
 fn scan_with_bases(root: &Path, progress: &Progress, bases: &findings::Bases) -> Tree {
-    let root_meta = fs::symlink_metadata(root).ok();
-    let mut allowed_devices: HashSet<u64> = root_meta.iter().map(|m| m.dev()).collect();
-    let mut skip: HashSet<PathBuf> = ["/dev", "/Volumes", "/System/Volumes", "/net", "/home"]
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
-    skip.remove(root);
+    scan_with_meta(root, progress, bases).0
+}
 
-    // On macOS, `/` is a sealed system volume whose user data lives on a separate
-    // APFS volume that is stitched in with firmlinks (e.g. /Users, /Applications).
-    if root == Path::new("/") {
-        if let Ok(data) = fs::metadata("/System/Volumes/Data") {
-            allowed_devices.insert(data.dev());
-        }
-    }
-
-    let mut walker = Walker {
-        progress,
-        allowed_devices,
-        skip,
-        hardlinks: Mutex::new(HashSet::new()),
-        prescanned: Mutex::new(HashMap::new()),
-        prescanned_paths: HashSet::new(),
-    };
+fn scan_with_meta(root: &Path, progress: &Progress, bases: &findings::Bases) -> (Tree, ScanMeta) {
+    let (mut walker, root_meta) = Walker::new(root, progress);
     let own = root_meta.as_ref().map(disk_size).unwrap_or(0);
+    let ino = root_meta.as_ref().map(|m| m.ino()).unwrap_or(0);
     dirlist::raise_fd_limit();
     dirlist::disable_cloud_downloads();
     let walk_start = std::time::Instant::now();
@@ -461,20 +530,320 @@ fn scan_with_bases(root: &Path, progress: &Progress, bases: &findings::Bases) ->
     walker.prescan_hotspots(root, &hotspots);
     walker.prescanned_paths = hotspots.into_iter().map(|(path, _)| path).collect();
     progress.hotspots_done_ms.store(elapsed_ms().max(1), Ordering::Relaxed);
-    let raw = walker.walk_dir(None, root, display_name(root), own, &progress.live, 0);
+    let raw = walker.walk_dir(None, root, display_name(root), ino, own, &progress.live, 0);
     debug_assert!(walker.prescanned.lock().unwrap().is_empty(), "a hotspot was never spliced in");
     let flatten_start = std::time::Instant::now();
 
     let mut nodes = Vec::new();
-    flatten(raw, None, &mut nodes);
+    let mut inos = Vec::new();
+    flatten(raw, None, &mut nodes, &mut inos);
     if std::env::var_os("PETAL_PHASES").is_some() {
         eprintln!("  walk {:.3}s  flatten {:.3}s", (flatten_start - walk_start).as_secs_f64(), flatten_start.elapsed().as_secs_f64());
     }
-    Tree {
+    let tree = Tree {
         root_path: root.to_path_buf(),
         nodes,
         errors: progress.errors.load(Ordering::Relaxed),
         cloud_only: progress.cloud_only.load(Ordering::Relaxed),
+    };
+    let marks = resolve_marks(&tree, walker.marks.into_inner().unwrap());
+    (tree, ScanMeta { inos, marks })
+}
+
+/// Path-keyed marks to node indices, sorted. Marks are rare, so `find` is fine.
+fn resolve_marks(tree: &Tree, marks: Vec<(PathBuf, Mark)>) -> Vec<(usize, Mark)> {
+    let mut out: Vec<(usize, Mark)> = marks.into_iter().filter_map(|(path, mark)| Some((tree.find(&path)?, mark))).collect();
+    out.sort_by_key(|m| m.0);
+    out
+}
+
+/// Incremental rescans from a cached tree.
+// ponytail: only the tests call this until wave 2 wires up FSEvents.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod incremental {
+    use super::*;
+    use crate::cache::Cached;
+
+    /// Why `rescan` couldn't run; do a full scan instead.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Fallback {
+        /// The root is gone, replaced, or isn't the cached one.
+        Root,
+        /// Hard links on a changed path: cached per-folder link sizes can't be re-deduplicated.
+        // ponytail: v1 policy; exact re-dedup during reuse if this falls back too often.
+        HardLinks,
+    }
+
+    /// A folder in `rescan`'s result, before it is flattened.
+    enum Part {
+        Fresh(Raw),
+        /// A cached subtree reused as is.
+        Reused(usize),
+        Dir { name: String, size: u64, items: u64, ino: u64, children: Vec<Part> },
+    }
+
+    /// The cached tree and which of its folders `rescan` must re-list.
+    struct Prior {
+        cached: Cached,
+        /// Dirty, or an ancestor of a dirty folder.
+        on_path: Vec<bool>,
+        /// Walk fresh, reusing nothing.
+        rewalk: Vec<bool>,
+    }
+
+    impl Prior {
+        fn size(&self, part: &Part) -> (u64, u64) {
+            match part {
+                Part::Fresh(raw) => (raw.size, raw.items),
+                Part::Reused(ix) => (self.cached.nodes[*ix].size, self.cached.nodes[*ix].items),
+                Part::Dir { size, items, .. } => (*size, *items),
+            }
+        }
+    }
+
+    /// Bring a cached scan of `root` up to date, re-listing only folders on the path to a
+    /// `dirty` one (`true`: everything below it changed too). The result is identical to a
+    /// full scan's, as long as `dirty` covers every changed folder.
+    pub fn rescan(root: &Path, progress: &Progress, cached: Cached, dirty: &[(PathBuf, bool)]) -> Result<(Tree, ScanMeta), Fallback> {
+        let _ = progress.started.set(std::time::Instant::now());
+        let (walker, root_meta) = Walker::new(root, progress);
+        let root_meta = root_meta
+            .filter(|m| m.is_dir() && m.ino() == cached.header.root_ino && cached.header.root == root)
+            .ok_or(Fallback::Root)?;
+
+        let nodes = &cached.nodes;
+        let (mut on_path, mut rewalk) = (vec![false; nodes.len()], vec![false; nodes.len()]);
+        // Unreadable folders may have become readable (e.g. Full Disk Access) with no event.
+        let mut dirty_ix: Vec<usize> = cached.marks.iter().filter(|(_, m)| m.errors > 0).map(|m| m.0).collect();
+        for (path, recursive) in dirty {
+            let Ok(relative) = path.strip_prefix(root) else { continue };
+            if path.ancestors().take_while(|a| *a != root).any(|a| walker.skip.contains(a)) {
+                continue;
+            }
+            // The deepest cached folder on the path; a missing one leaves its parent dirty.
+            let (mut at, mut exact) = (Tree::ROOT, true);
+            for component in relative.components() {
+                let name = component.as_os_str().to_string_lossy();
+                match nodes[at].children.iter().find(|&&c| nodes[c].kind == Kind::Dir && nodes[c].name.as_ref() == name) {
+                    Some(&c) => at = c,
+                    None => {
+                        exact = false;
+                        break;
+                    }
+                }
+            }
+            rewalk[at] |= exact && *recursive;
+            dirty_ix.push(at);
+        }
+        on_path[Tree::ROOT] = true;
+        for ix in dirty_ix {
+            let mut cur = Some(ix);
+            while let Some(i) = cur.filter(|&i| !on_path[i]) {
+                on_path[i] = true;
+                cur = nodes[i].parent;
+            }
+        }
+        if cached.marks.iter().any(|(ix, m)| m.hardlinks && on_path[*ix]) {
+            return Err(Fallback::HardLinks);
+        }
+
+        dirlist::raise_fd_limit();
+        dirlist::disable_cloud_downloads();
+        let (own, ino, name) = (disk_size(&root_meta), root_meta.ino(), display_name(root));
+        let prior = Prior { cached, on_path, rewalk };
+        let part = if prior.rewalk[Tree::ROOT] {
+            Part::Fresh(walker.walk_dir(None, root, name, ino, own, &progress.live, 0))
+        } else {
+            walker.merge(&prior, Tree::ROOT, None, root, name, ino, own, &progress.live, 0)
+        };
+        if walker.saw_hardlink.load(Ordering::Relaxed) {
+            return Err(Fallback::HardLinks);
+        }
+
+        let mut cached = prior.cached;
+        let (mut nodes, mut inos, mut marks) = (Vec::new(), Vec::new(), Vec::new());
+        emit(part, None, &mut cached, &mut nodes, &mut inos, &mut marks);
+        drop(cached);
+        let tree = Tree {
+            root_path: root.to_path_buf(),
+            nodes,
+            errors: progress.errors.load(Ordering::Relaxed),
+            cloud_only: progress.cloud_only.load(Ordering::Relaxed),
+        };
+        marks.extend(resolve_marks(&tree, walker.marks.into_inner().unwrap()));
+        marks.sort_by_key(|m| m.0);
+        Ok((tree, ScanMeta { inos, marks }))
+    }
+
+    impl Walker<'_> {
+        /// `rescan`'s walk of an on-path folder: re-list it, reuse clean cached subfolders,
+        /// walk new or replaced ones fresh. Children are assembled exactly like `walk_dir`'s.
+        #[allow(clippy::too_many_arguments)]
+        fn merge(
+            &self,
+            prior: &Prior,
+            ix: usize,
+            parent: Option<&dirlist::Dir>,
+            path: &Path,
+            name: String,
+            ino: u64,
+            own: u64,
+            live: &LiveNode,
+            depth: usize,
+        ) -> Part {
+            if self.progress.cancelled.load(Ordering::Relaxed) {
+                return Part::Fresh(self.walk_dir(parent, path, name, ino, own, live, depth));
+            }
+            let (dir, files, subdirs) = self.read(parent, path, &name, own, live);
+            let cached = &prior.cached;
+            let kids: HashMap<&str, usize> = cached.nodes[ix]
+                .children
+                .iter()
+                .filter(|&&c| cached.nodes[c].kind == Kind::Dir)
+                .map(|&c| (cached.nodes[c].name.as_ref(), c))
+                .collect();
+            let subdir_parts: Vec<Part> = subdirs
+                .into_par_iter()
+                .filter_map(|entry| {
+                    let reusable = kids.get(entry.name.as_str()).copied().filter(|&c| {
+                        !prior.rewalk[c]
+                            && cached.inos[c] == entry.ino
+                            && cached.own(c) == entry.size
+                            && !entry.dataless
+                            && !cached.mark(c).dataless
+                    });
+                    let Some(c) = reusable else {
+                        return self.walk_subdir(dir.as_ref(), path, entry, live, depth + 1).map(Part::Fresh);
+                    };
+                    let child_path = path.join(&entry.name);
+                    if !self.admits(&child_path, &entry) {
+                        return None;
+                    }
+                    let own_live = (depth < LIVE_DEPTH).then(|| live.child(&entry.name));
+                    let child_live = own_live.as_deref().unwrap_or(live);
+                    let part = if prior.on_path[c] {
+                        self.merge(prior, c, dir.as_ref(), &child_path, entry.name, entry.ino, entry.size, child_live, depth + 1)
+                    } else {
+                        self.reuse(cached, c, child_live, depth + 1);
+                        Part::Reused(c)
+                    };
+                    if let Some(own) = &own_live {
+                        if !self.progress.cancelled.load(Ordering::Relaxed) {
+                            own.done.store(true, Ordering::Release);
+                        }
+                    }
+                    Some(part)
+                })
+                .collect();
+            drop(dir);
+            let mut children: Vec<Part> = files.into_iter().map(Part::Fresh).collect();
+            children.extend(subdir_parts);
+            children.sort_by(|a, b| prior.size(b).0.cmp(&prior.size(a).0));
+
+            let (mut size, mut items) = (own, 0);
+            for child in &children {
+                let (s, i) = prior.size(child);
+                size += s;
+                items += i;
+            }
+            Part::Dir { name, size, items, ino, children }
+        }
+
+        /// Count a reused cached subtree as if it had just been walked.
+        fn reuse(&self, cached: &Cached, ix: usize, live: &LiveNode, depth: usize) {
+            let end = cached.sub_end[ix];
+            let (mut files, mut bytes, mut dirs) = (0, 0, 0);
+            for node in &cached.nodes[ix..end] {
+                if node.kind == Kind::File {
+                    files += 1;
+                    bytes += node.size;
+                } else {
+                    dirs += 1;
+                }
+            }
+            let cloud_only = cached.marks_in(ix, end).iter().filter(|m| m.1.dataless).count() as u64;
+            self.progress.files.fetch_add(files, Ordering::Relaxed);
+            self.progress.bytes.fetch_add(bytes, Ordering::Relaxed);
+            // Folders "listed", as the progress bar counts them.
+            self.progress.dirs.fetch_add(dirs - cloud_only, Ordering::Relaxed);
+            self.progress.cloud_only.fetch_add(cloud_only, Ordering::Relaxed);
+            seed_live(cached, ix, live, depth);
+        }
+    }
+
+    /// Record a reused folder in the live tree the way the full walk would have, final at once.
+    /// `live` is its own node within `LIVE_DEPTH`, else its nearest live ancestor's.
+    fn seed_live(cached: &Cached, ix: usize, live: &LiveNode, depth: usize) {
+        let node = &cached.nodes[ix];
+        if depth >= LIVE_DEPTH {
+            live.record(node.size, node.items);
+        } else {
+            let (mut size, mut items) = (node.size, node.items);
+            for &c in &node.children {
+                let child = &cached.nodes[c];
+                if child.kind == Kind::Dir {
+                    size -= child.size;
+                    items -= child.items;
+                    seed_live(cached, c, &live.child(&child.name), depth + 1);
+                }
+            }
+            live.record(size, items);
+        }
+        if depth <= LIVE_DEPTH {
+            live.done.store(true, Ordering::Release);
+        }
+    }
+
+    /// Flatten a `Part` in pre-order. Reused ranges are moved out of `cached`, not cloned.
+    fn emit(part: Part, parent: Option<usize>, cached: &mut Cached, nodes: &mut Vec<Node>, inos: &mut Vec<u64>, marks: &mut Vec<(usize, Mark)>) -> usize {
+        match part {
+            Part::Fresh(raw) => flatten(raw, parent, nodes, inos),
+            Part::Reused(ix) => {
+                let (base, end) = (nodes.len(), cached.sub_end[ix]);
+                let remap = |i: usize| i - ix + base;
+                for k in ix..end {
+                    let node = &mut cached.nodes[k];
+                    let mut children = std::mem::take(&mut node.children);
+                    children.iter_mut().for_each(|c| *c = remap(*c));
+                    nodes.push(Node {
+                        name: std::mem::replace(&mut node.name, SharedString::new_static("")),
+                        size: node.size,
+                        kind: node.kind,
+                        parent: if k == ix { parent } else { node.parent.map(remap) },
+                        children,
+                        items: node.items,
+                    });
+                }
+                inos.extend_from_slice(&cached.inos[ix..end]);
+                marks.extend(cached.marks_in(ix, end).iter().map(|&(k, m)| (remap(k), m)));
+                base
+            }
+            Part::Dir { name, size, items, ino, children } => {
+                let ix = nodes.len();
+                nodes.push(Node { name: name.into(), size, kind: Kind::Dir, parent, children: Vec::with_capacity(children.len()), items });
+                inos.push(ino);
+                for child in children {
+                    let child_ix = emit(child, Some(ix), cached, nodes, inos, marks);
+                    nodes[ix].children.push(child_ix);
+                }
+                ix
+            }
+        }
+    }
+
+    /// Every node as (path, kind, size, items), in pre-order: equal fingerprints mean equal
+    /// trees, children order included.
+    pub fn fingerprint(tree: &Tree) -> Vec<(String, Kind, u64, u64)> {
+        let mut out = Vec::with_capacity(tree.nodes.len());
+        let mut stack = vec![(Tree::ROOT, String::new())];
+        while let Some((ix, path)) = stack.pop() {
+            let node = &tree.nodes[ix];
+            for &c in node.children.iter().rev() {
+                stack.push((c, format!("{path}/{}", tree.nodes[c].name)));
+            }
+            out.push((path, node.kind, node.size, node.items));
+        }
+        out
     }
 }
 
@@ -650,8 +1019,9 @@ pub fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-fn flatten(raw: Raw, parent: Option<usize>, nodes: &mut Vec<Node>) -> usize {
+fn flatten(raw: Raw, parent: Option<usize>, nodes: &mut Vec<Node>, inos: &mut Vec<u64>) -> usize {
     let ix = nodes.len();
+    inos.push(raw.ino);
     nodes.push(Node {
         name: raw.name.into(),
         size: raw.size,
@@ -661,7 +1031,7 @@ fn flatten(raw: Raw, parent: Option<usize>, nodes: &mut Vec<Node>) -> usize {
         items: raw.items,
     });
     for child in raw.children {
-        let child_ix = flatten(child, Some(ix), nodes);
+        let child_ix = flatten(child, Some(ix), nodes, inos);
         nodes[ix].children.push(child_ix);
     }
     ix
@@ -763,6 +1133,7 @@ pub fn volumes() -> Vec<Volume> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use incremental::fingerprint;
 
     fn write(path: &Path, bytes: usize) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -835,6 +1206,158 @@ mod tests {
             tree.nodes[someone].children.iter().map(|&c| (tree.nodes[c].name.to_string(), tree.nodes[c].size)).collect::<Vec<_>>()
         };
         assert_eq!(downloads(&plain), downloads(&spliced));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn cache_of(tree: &Tree, meta: &ScanMeta) -> crate::cache::Cached {
+        let header = crate::cache::Header {
+            root: tree.root_path.clone(),
+            device_uuid: "test".into(),
+            event_id: 0,
+            root_ino: meta.inos[Tree::ROOT],
+            has_fda: true,
+        };
+        crate::cache::decode(&crate::cache::encode(tree, meta, &header)).unwrap()
+    }
+
+    fn full(dir: &Path) -> (Tree, ScanMeta) {
+        scan_with_meta(dir, &Progress::default(), &findings::Bases::default())
+    }
+
+    fn rescan(dir: &Path, cached: crate::cache::Cached, dirty: &[&str]) -> (Result<(Tree, ScanMeta), incremental::Fallback>, Progress) {
+        let progress = Progress::default();
+        let dirty: Vec<(PathBuf, bool)> = dirty.iter().map(|d| (dir.join(d), false)).collect();
+        (incremental::rescan(dir, &progress, cached, &dirty), progress)
+    }
+
+    #[test]
+    fn cache_round_trips() {
+        let dir = std::env::temp_dir().join(format!("petal-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write(&dir.join("a/one.bin"), 5000);
+        write(&dir.join("a/b/two.bin"), 70000);
+        write(&dir.join("üñí/three"), 1);
+        fs::hard_link(dir.join("a/one.bin"), dir.join("a/link.bin")).unwrap();
+        write(&dir.join("locked/x"), 1);
+        fs::set_permissions(dir.join("locked"), std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        let (tree, meta) = full(&dir);
+        fs::set_permissions(dir.join("locked"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert!(meta.marks.iter().any(|m| m.1.errors > 0) && meta.marks.iter().any(|m| m.1.hardlinks));
+
+        let header = crate::cache::Header { root: dir.clone(), device_uuid: "uuid".into(), event_id: 42, root_ino: meta.inos[0], has_fda: false };
+        let file = dir.join("scan.cache");
+        crate::cache::write_atomic(&file, &crate::cache::encode(&tree, &meta, &header)).unwrap();
+        let buf = fs::read(&file).unwrap();
+        let cached = crate::cache::decode(&buf).unwrap();
+        assert_eq!(cached.header, header);
+        assert_eq!(cached.inos, meta.inos);
+        assert_eq!(cached.marks, meta.marks);
+        let decoded = Tree { root_path: dir.clone(), nodes: cached.nodes, errors: 0, cloud_only: 0 };
+        assert_eq!(fingerprint(&decoded), fingerprint(&tree));
+        for (ix, &end) in cached.sub_end.iter().enumerate() {
+            assert!((ix + 1..end).all(|k| decoded.is_ancestor_or_self(ix, k)));
+        }
+        for len in 0..buf.len() {
+            assert!(crate::cache::decode(&buf[..len]).is_none());
+        }
+        for at in 0..buf.len() {
+            let mut bad = buf.clone();
+            bad[at] ^= 0x10;
+            assert!(crate::cache::decode(&bad).is_none());
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn incremental_matches_full() {
+        let dir = std::env::temp_dir().join(format!("petal-incremental-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write(&dir.join("keep/a/b/c/d/deep.bin"), 4096);
+        write(&dir.join("keep/sib/x.bin"), 9000);
+        write(&dir.join("add/f1"), 100);
+        write(&dir.join("grow/g.bin"), 100);
+        write(&dir.join("del/sub/x"), 20000);
+        write(&dir.join("x/old"), 3000);
+        write(&dir.join("y/new"), 7000);
+        for name in ["e1", "e2", "e3"] {
+            write(&dir.join("tie").join(name), 8192);
+        }
+        write(&dir.join("tie/grower"), 10);
+        for i in 0..20 {
+            write(&dir.join(format!("clean/n{i}/f")), 100 * i);
+        }
+        let (a, meta) = full(&dir);
+        let cached = cache_of(&a, &meta);
+
+        write(&dir.join("add/f2"), 50000);
+        write(&dir.join("grow/g.bin"), 300000);
+        fs::remove_dir_all(dir.join("del/sub")).unwrap();
+        write(&dir.join("new/l1/l2/f"), 12345);
+        fs::rename(dir.join("x"), dir.join("x.old")).unwrap();
+        fs::rename(dir.join("y"), dir.join("x")).unwrap();
+        write(&dir.join("tie/grower"), 8192);
+        write(&dir.join("keep/a/b/c/d/deep.bin"), 200000);
+        let dirty = ["", "add", "grow", "del", "del/sub", "new", "new/l1", "new/l1/l2", "tie", "keep/a/b/c/d"];
+        let (b, progress) = rescan(&dir, cached, &dirty);
+        let (b, meta_b) = b.unwrap();
+        let full_progress = Progress::default();
+        let (c, meta_c) = scan_with_meta(&dir, &full_progress, &findings::Bases::default());
+        assert_eq!(fingerprint(&b), fingerprint(&c));
+        assert_eq!((b.errors, b.cloud_only), (c.errors, c.cloud_only));
+        assert_eq!(meta_b.inos, meta_c.inos);
+        assert_eq!(meta_b.marks, meta_c.marks);
+        assert_eq!(progress.files.load(Ordering::Relaxed), full_progress.files.load(Ordering::Relaxed));
+        let live = crate::live::snapshot(&progress.live, &dir, None).tree;
+        assert_eq!(live.nodes[Tree::ROOT].size, b.nodes[Tree::ROOT].size, "live totals");
+
+        // Not vacuous: an unreported change in a clean folder stays unseen, so it was reused.
+        let cached = cache_of(&b, &meta_b);
+        write(&dir.join("clean/n3/f"), 400000);
+        let (stale, _) = rescan(&dir, cached, &[]);
+        assert_eq!(fingerprint(&stale.unwrap().0), fingerprint(&b));
+        assert_ne!(fingerprint(&full(&dir).0), fingerprint(&b));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn incremental_falls_back_on_hardlinks() {
+        let dir = std::env::temp_dir().join(format!("petal-incr-links-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write(&dir.join("a/f"), 5000);
+        write(&dir.join("b/g"), 5000);
+        let (tree, meta) = full(&dir);
+        // A new link in a dirty folder.
+        fs::hard_link(dir.join("a/f"), dir.join("a/l")).unwrap();
+        let (result, _) = rescan(&dir, cache_of(&tree, &meta), &["a"]);
+        assert_eq!(result.err(), Some(incremental::Fallback::HardLinks));
+        // A cached link on a changed path.
+        let (tree, meta) = full(&dir);
+        write(&dir.join("a/h"), 1);
+        let (result, _) = rescan(&dir, cache_of(&tree, &meta), &["a"]);
+        assert_eq!(result.err(), Some(incremental::Fallback::HardLinks));
+        // Links off the changed path are fine.
+        let (result, _) = rescan(&dir, cache_of(&tree, &meta), &["b"]);
+        assert!(result.is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn incremental_relists_error_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("petal-incr-errors-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write(&dir.join("locked/inner/x"), 30000);
+        write(&dir.join("open/y"), 1000);
+        fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let (a, meta) = full(&dir);
+        fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(a.errors, 1);
+        // No event for it, but now readable: it must be listed again.
+        let (b, _) = rescan(&dir, cache_of(&a, &meta), &[]);
+        let (b, _) = b.unwrap();
+        let c = full(&dir).0;
+        assert_eq!(b.errors, 0);
+        assert_eq!(fingerprint(&b), fingerprint(&c));
         fs::remove_dir_all(&dir).unwrap();
     }
 
