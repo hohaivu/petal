@@ -242,14 +242,10 @@ impl Walker<'_> {
             return Raw { name, size: 0, kind: Kind::Dir, items: 0, children: Vec::new() };
         }
         crate::clock::gate();
-        // The UI reads `current` at ~10 Hz; every 64th folder is plenty.
-        let n = self.progress.dirs.fetch_add(1, Ordering::Relaxed);
-        if n % 64 == 0 {
-            if let Ok(mut current) = self.progress.current.try_lock() {
-                current.clear();
-                current.push_str(&path.to_string_lossy());
-            }
+        if let Ok(mut current) = self.progress.current.try_lock() {
+            *current = path.to_string_lossy().into_owned();
         }
+        self.progress.dirs.fetch_add(1, Ordering::Relaxed);
 
         // Relative open is the fast path; fall back to the full path (e.g. on EMFILE).
         let dir = match parent {
