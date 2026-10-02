@@ -160,9 +160,6 @@ struct Walker<'a> {
     /// Read-only copy of the prescanned paths, so the main walk can check membership
     /// without taking a lock for every folder.
     prescanned_paths: HashSet<PathBuf>,
-    /// Deepest level (root = 0) at which `skip` or `prescanned_paths` can match; deeper
-    /// folders skip both lookups.
-    match_depth: usize,
 }
 
 /// Allocated size on disk, which is what actually frees up when a file is deleted.
@@ -317,13 +314,12 @@ impl Walker<'_> {
         depth: usize,
     ) -> Option<Raw> {
         let path = parent.join(&*entry.name);
-        let may_match = depth <= self.match_depth;
-        if (may_match && self.skip.contains(&path)) || !self.allowed_devices.contains(&entry.dev) {
+        if self.skip.contains(&path) || !self.allowed_devices.contains(&entry.dev) {
             return None;
         }
         let own_live = (depth <= LIVE_DEPTH).then(|| parent_live.child(&entry.name));
         let live = own_live.as_deref().unwrap_or(parent_live);
-        if may_match && self.prescanned_paths.contains(&path) {
+        if self.prescanned_paths.contains(&path) {
             if let Some(raw) = self.prescanned.lock().unwrap().remove(&path) {
                 return Some(raw);
             }
@@ -457,7 +453,6 @@ fn scan_with_bases(root: &Path, progress: &Progress, bases: &findings::Bases) ->
         hardlinks: Mutex::new(HashSet::new()),
         prescanned: Mutex::new(HashMap::new()),
         prescanned_paths: HashSet::new(),
-        match_depth: usize::MAX,
     };
     let own = root_meta.as_ref().map(disk_size).unwrap_or(0);
     dirlist::raise_fd_limit();
@@ -469,11 +464,6 @@ fn scan_with_bases(root: &Path, progress: &Progress, bases: &findings::Bases) ->
     let hotspots = hotspots(root, bases, &walker);
     walker.prescan_hotspots(root, &hotspots);
     walker.prescanned_paths = hotspots.into_iter().map(|(path, _)| path).collect();
-    walker.match_depth = walker.skip.iter().chain(&walker.prescanned_paths)
-        .filter_map(|p| p.strip_prefix(root).ok())
-        .map(|p| p.components().count())
-        .max()
-        .unwrap_or(0);
     progress.hotspots_done_ms.store(elapsed_ms().max(1), Ordering::Relaxed);
     let raw = walker.walk_dir(None, root, display_name(root).into(), own, &progress.live, 0);
     debug_assert!(walker.prescanned.lock().unwrap().is_empty(), "a hotspot was never spliced in");
