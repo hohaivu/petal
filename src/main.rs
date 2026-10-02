@@ -39,7 +39,9 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("--bench-rescan") {
         let path = PathBuf::from(args.get(2).expect("path required"));
         let runs = args.get(3).and_then(|r| r.parse().ok()).unwrap_or(3);
-        scan::bench_rescan(&path, runs);
+        if !scan::bench_rescan(&path, runs) {
+            std::process::exit(1);
+        }
         return;
     }
     // Diagnostic: does this process have Full Disk Access? (Launch through `open` to ask

@@ -19,6 +19,14 @@ pub struct Entry {
     pub dataless: bool,
     /// Set for files that share disk blocks with other files through APFS cloning.
     pub sharing: Option<Sharing>,
+    /// When its metadata (mode, owner, ACL, entries) last changed, as `stamp` makes it;
+    /// 0 if unknown. An incremental rescan reuses a cached folder only if this is unchanged.
+    pub ctime: u64,
+}
+
+/// A change time as one comparable number (nanoseconds); 0, meaning unknown, if unset.
+pub fn stamp(sec: i64, nsec: i64) -> u64 {
+    if sec <= 0 { 0 } else { (sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64) }
 }
 
 /// `Sharing::private` for partial clones until it is looked up (see `private_size`).
@@ -141,6 +149,7 @@ pub fn list_std(path: &Path) -> io::Result<Listing> {
                 size: meta.blocks() * 512,
                 dataless: is_dataless(&meta),
                 sharing: None,
+                ctime: stamp(meta.ctime(), meta.ctime_nsec()),
             }),
             Err(_) => listing.errors += 1,
         }
@@ -267,6 +276,7 @@ mod macos {
             | libc::ATTR_CMN_NAME
             | libc::ATTR_CMN_DEVID
             | libc::ATTR_CMN_OBJTYPE
+            | libc::ATTR_CMN_CHGTIME
             | libc::ATTR_CMN_FLAGS
             | libc::ATTR_CMN_FILEID;
         attrs.dirattr = libc::ATTR_DIR_MOUNTSTATUS | libc::ATTR_DIR_ALLOCSIZE;
@@ -342,6 +352,11 @@ mod macos {
         if returned.commonattr & libc::ATTR_CMN_OBJTYPE != 0 {
             obj_type = read(buf, &mut at);
         }
+        let mut ctime = 0u64;
+        if returned.commonattr & libc::ATTR_CMN_CHGTIME != 0 {
+            let t: libc::timespec = read(buf, &mut at);
+            ctime = super::stamp(t.tv_sec, t.tv_nsec);
+        }
         let mut flags = 0u32;
         if returned.commonattr & libc::ATTR_CMN_FLAGS != 0 {
             flags = read(buf, &mut at);
@@ -395,7 +410,7 @@ mod macos {
             private: PRIVATE_UNKNOWN,
             all: ext_flags & EF_SHARES_ALL_BLOCKS != 0,
         });
-        Some(Entry { name, is_dir, dev, ino, nlink, size, dataless, sharing })
+        Some(Entry { name, is_dir, dev, ino, nlink, size, dataless, sharing, ctime })
     }
 
     const EF_MAY_SHARE_BLOCKS: u64 = 0x1;
@@ -469,12 +484,14 @@ mod tests {
             for (b, s) in bulk.iter().zip(&std) {
                 assert_eq!(b.is_dir, s.is_dir, "{dir:?}/{} is_dir", b.name);
                 assert_eq!(b.dataless, s.dataless, "{dir:?}/{} dataless", b.name);
+                assert!(b.ctime != 0, "{dir:?}/{} ctime", b.name);
                 // Mount points report the covered directory's inode, so only compare files.
                 if !b.is_dir {
                     assert_eq!(b.ino, s.ino, "{dir:?}/{} ino", b.name);
                     assert_eq!(b.dev, s.dev, "{dir:?}/{} dev", b.name);
                     assert_eq!(b.size, s.size, "{dir:?}/{} size", b.name);
                     assert_eq!(b.nlink, s.nlink, "{dir:?}/{} nlink", b.name);
+                    assert_eq!(b.ctime, s.ctime, "{dir:?}/{} ctime", b.name);
                 }
             }
         }

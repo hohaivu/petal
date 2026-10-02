@@ -129,7 +129,10 @@ It falls back to a full scan when there's any doubt: external volumes (always fu
 history, no cache, a different device UUID or Full Disk Access state than when the cache was written,
 dropped or wrapped events, a remount, a must-rescan above the root, a 10 s history timeout, a replaced
 root, or hard links in a re-listed folder. File ▸ Full Rescan (⌘⇧R) forces a full scan. Folders that
-were unreadable are always re-listed, since granting access sends no event.
+were unreadable are always re-listed, since granting access sends no event. Changing a folder's
+mode, owner or ACL sends an event for its parent only, so each cached folder also keeps its change
+time (ctime, to the nanosecond, read before it was listed): a clean folder whose change time differs
+is walked fresh instead of reused.
 
 `fsevents_incremental_end_to_end` is the gate. It changes a fixture, waits for the events, and
 checks that the incremental path was taken and matches a full scan exactly. `--bench-rescan` does
@@ -153,4 +156,4 @@ background load, and refuses to report a speed-up if the two results differ.
 `--bench-rescan` checks the two results for equality. On a live tree like `~/Library`, both scans see
 apps writing files, and hard links are charged to whichever link the parallel walk reaches first. So a
 MISMATCH there can be real drift: two full scans differ the same way. On a quiet tree (`/Applications`)
-it reports `gate ok`.
+it reports `gate ok`. It exits 1 if any run mismatched.

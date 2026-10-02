@@ -163,6 +163,8 @@ struct Raw {
     items: u64,
     /// Folders only (0 for files).
     ino: u64,
+    /// Folders only: `dirlist::Entry::ctime` from just before it was listed.
+    stamp: u64,
     children: Vec<Raw>,
 }
 
@@ -181,6 +183,8 @@ pub struct Mark {
 pub struct ScanMeta {
     /// Per node; 0 for files.
     pub inos: Vec<u64>,
+    /// Per node, as `Raw::stamp`.
+    pub stamps: Vec<u64>,
     /// Sorted by node index.
     pub marks: Vec<(usize, Mark)>,
 }
@@ -281,8 +285,12 @@ impl<'a> Walker<'a> {
                 // Read the folder's own allocation now (the same attribute its parent's listing
                 // reports), so its total is exact, and final, as soon as this pass ends.
                 let own = dirlist::dir_alloc(path).unwrap_or(0);
+                // Stamp it before listing, not when its parent's listing comes later: a change
+                // in between must leave a stale stamp, so the next rescan lists it again.
+                let stamp = fs::symlink_metadata(path).map(|m| dirlist::stamp(m.ctime(), m.ctime_nsec())).unwrap_or(0);
                 // `walk_subdir` fills in the inode when it splices this in.
-                let raw = self.walk_dir(None, path, display_name(path), 0, own, &live, depth);
+                let mut raw = self.walk_dir(None, path, display_name(path), 0, own, &live, depth);
+                raw.stamp = stamp;
                 if depth <= LIVE_DEPTH {
                     live.done.store(true, Ordering::Release);
                 }
@@ -357,7 +365,7 @@ impl<'a> Walker<'a> {
             }
             count += 1;
             bytes += size;
-            files.push(Raw { name: entry.name, size, kind: Kind::File, items: 1, ino: 0, children: Vec::new() });
+            files.push(Raw { name: entry.name, size, kind: Kind::File, items: 1, ino: 0, stamp: 0, children: Vec::new() });
         }
         self.progress.files.fetch_add(count, Ordering::Relaxed);
         self.progress.bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -385,7 +393,7 @@ impl<'a> Walker<'a> {
         depth: usize,
     ) -> Raw {
         if self.progress.cancelled.load(Ordering::Relaxed) {
-            return Raw { name, size: 0, kind: Kind::Dir, items: 0, ino, children: Vec::new() };
+            return Raw { name, size: 0, kind: Kind::Dir, items: 0, ino, stamp: 0, children: Vec::new() };
         }
         let (dir, mut children, subdirs) = self.read(parent, path, &name, own, live);
         let subdir_results: Vec<Raw> = subdirs
@@ -398,7 +406,7 @@ impl<'a> Walker<'a> {
 
         let size = own + children.iter().map(|c| c.size).sum::<u64>();
         let items = children.iter().map(|c| c.items).sum();
-        Raw { name, size, kind: Kind::Dir, items, ino, children }
+        Raw { name, size, kind: Kind::Dir, items, ino, stamp: 0, children }
     }
 
     fn walk_subdir(
@@ -430,9 +438,10 @@ impl<'a> Walker<'a> {
             if let Some(own) = &own_live {
                 own.done.store(true, Ordering::Release);
             }
-            return Some(Raw { name: entry.name, size: entry.size, kind: Kind::Dir, items: 0, ino: entry.ino, children: Vec::new() });
+            return Some(Raw { name: entry.name, size: entry.size, kind: Kind::Dir, items: 0, ino: entry.ino, stamp: entry.ctime, children: Vec::new() });
         }
-        let raw = self.walk_dir(dir, &path, entry.name, entry.ino, entry.size, live, depth);
+        let mut raw = self.walk_dir(dir, &path, entry.name, entry.ino, entry.size, live, depth);
+        raw.stamp = entry.ctime;
         if let Some(own) = &own_live {
             if !self.progress.cancelled.load(Ordering::Relaxed) {
                 own.done.store(true, Ordering::Release);
@@ -640,13 +649,14 @@ fn scan_with_meta(root: &Path, progress: &Progress, bases: &findings::Bases) -> 
     walker.prescan_hotspots(root, &hotspots);
     walker.prescanned_paths = hotspots.into_iter().map(|(path, _)| path).collect();
     progress.hotspots_done_ms.store(elapsed_ms().max(1), Ordering::Relaxed);
-    let raw = walker.walk_dir(None, root, display_name(root), ino, own, &progress.live, 0);
+    let mut raw = walker.walk_dir(None, root, display_name(root), ino, own, &progress.live, 0);
+    raw.stamp = root_meta.as_ref().map(meta_stamp).unwrap_or(0);
     debug_assert!(walker.prescanned.lock().unwrap().is_empty(), "a hotspot was never spliced in");
     let flatten_start = std::time::Instant::now();
 
     let mut nodes = Vec::new();
-    let mut inos = Vec::new();
-    flatten(raw, None, &mut nodes, &mut inos);
+    let (mut inos, mut stamps) = (Vec::new(), Vec::new());
+    flatten(raw, None, &mut nodes, &mut inos, &mut stamps);
     if std::env::var_os("PETAL_PHASES").is_some() {
         eprintln!("  walk {:.3}s  flatten {:.3}s", (flatten_start - walk_start).as_secs_f64(), flatten_start.elapsed().as_secs_f64());
     }
@@ -657,7 +667,11 @@ fn scan_with_meta(root: &Path, progress: &Progress, bases: &findings::Bases) -> 
         cloud_only: progress.cloud_only.load(Ordering::Relaxed),
     };
     let marks = resolve_marks(&tree, walker.marks.into_inner().unwrap());
-    (tree, ScanMeta { inos, marks })
+    (tree, ScanMeta { inos, stamps, marks })
+}
+
+fn meta_stamp(meta: &fs::Metadata) -> u64 {
+    dirlist::stamp(meta.ctime(), meta.ctime_nsec())
 }
 
 /// Path-keyed marks to node indices, sorted. Marks are rare, so `find` is fine.
@@ -687,7 +701,7 @@ pub mod incremental {
         Fresh(Raw),
         /// A cached subtree reused as is.
         Reused(usize),
-        Dir { name: String, size: u64, items: u64, ino: u64, children: Vec<Part> },
+        Dir { name: String, size: u64, items: u64, ino: u64, stamp: u64, children: Vec<Part> },
     }
 
     /// The cached tree and which of its folders `rescan` must re-list.
@@ -757,20 +771,22 @@ pub mod incremental {
 
         dirlist::raise_fd_limit();
         dirlist::disable_cloud_downloads();
-        let (own, ino, name) = (disk_size(&root_meta), root_meta.ino(), display_name(root));
+        let (own, ino, stamp, name) = (disk_size(&root_meta), root_meta.ino(), meta_stamp(&root_meta), display_name(root));
         let prior = Prior { cached, on_path, rewalk };
         let part = if prior.rewalk[Tree::ROOT] {
-            Part::Fresh(walker.walk_dir(None, root, name, ino, own, &progress.live, 0))
+            let mut raw = walker.walk_dir(None, root, name, ino, own, &progress.live, 0);
+            raw.stamp = stamp;
+            Part::Fresh(raw)
         } else {
-            walker.merge(&prior, Tree::ROOT, None, root, name, ino, own, &progress.live, 0)
+            walker.merge(&prior, Tree::ROOT, None, root, name, ino, stamp, own, &progress.live, 0)
         };
         if walker.saw_hardlink.load(Ordering::Relaxed) {
             return Err(Fallback::HardLinks);
         }
 
         let mut cached = prior.cached;
-        let (mut nodes, mut inos, mut marks) = (Vec::new(), Vec::new(), Vec::new());
-        emit(part, None, &mut cached, &mut nodes, &mut inos, &mut marks);
+        let (mut nodes, mut meta) = (Vec::new(), ScanMeta { inos: Vec::new(), stamps: Vec::new(), marks: Vec::new() });
+        emit(part, None, &mut cached, &mut nodes, &mut meta);
         drop(cached);
         let tree = Tree {
             root_path: root.to_path_buf(),
@@ -778,9 +794,9 @@ pub mod incremental {
             errors: progress.errors.load(Ordering::Relaxed),
             cloud_only: progress.cloud_only.load(Ordering::Relaxed),
         };
-        marks.extend(resolve_marks(&tree, walker.marks.into_inner().unwrap()));
-        marks.sort_by_key(|m| m.0);
-        Ok((tree, ScanMeta { inos, marks }))
+        meta.marks.extend(resolve_marks(&tree, walker.marks.into_inner().unwrap()));
+        meta.marks.sort_by_key(|m| m.0);
+        Ok((tree, meta))
     }
 
     impl Walker<'_> {
@@ -795,6 +811,7 @@ pub mod incremental {
             path: &Path,
             name: String,
             ino: u64,
+            stamp: u64,
             own: u64,
             live: &LiveNode,
             depth: usize,
@@ -819,6 +836,9 @@ pub mod incremental {
                             && cached.own(c) == entry.size
                             && !entry.dataless
                             && !cached.mark(c).dataless
+                            // Off the dirty paths it isn't opened, so a change to its own mode,
+                            // owner or ACL (an event for its parent only) must show in its stamp.
+                            && (prior.on_path[c] || (entry.ctime != 0 && cached.stamps[c] == entry.ctime))
                     });
                     let Some(c) = reusable else {
                         return self.walk_subdir(dir.as_ref(), path, entry, live, depth + 1).map(Part::Fresh);
@@ -830,7 +850,7 @@ pub mod incremental {
                     let own_live = (depth < LIVE_DEPTH).then(|| live.child(&entry.name));
                     let child_live = own_live.as_deref().unwrap_or(live);
                     let part = if prior.on_path[c] {
-                        self.merge(prior, c, dir.as_ref(), &child_path, entry.name, entry.ino, entry.size, child_live, depth + 1)
+                        self.merge(prior, c, dir.as_ref(), &child_path, entry.name, entry.ino, entry.ctime, entry.size, child_live, depth + 1)
                     } else {
                         self.reuse(cached, c, child_live, depth + 1);
                         Part::Reused(c)
@@ -854,7 +874,7 @@ pub mod incremental {
                 size += s;
                 items += i;
             }
-            Part::Dir { name, size, items, ino, children }
+            Part::Dir { name, size, items, ino, stamp, children }
         }
 
         /// Count a reused cached subtree as if it had just been walked.
@@ -904,9 +924,9 @@ pub mod incremental {
     }
 
     /// Flatten a `Part` in pre-order. Reused ranges are moved out of `cached`, not cloned.
-    fn emit(part: Part, parent: Option<usize>, cached: &mut Cached, nodes: &mut Vec<Node>, inos: &mut Vec<u64>, marks: &mut Vec<(usize, Mark)>) -> usize {
+    fn emit(part: Part, parent: Option<usize>, cached: &mut Cached, nodes: &mut Vec<Node>, meta: &mut ScanMeta) -> usize {
         match part {
-            Part::Fresh(raw) => flatten(raw, parent, nodes, inos),
+            Part::Fresh(raw) => flatten(raw, parent, nodes, &mut meta.inos, &mut meta.stamps),
             Part::Reused(ix) => {
                 let (base, end) = (nodes.len(), cached.sub_end[ix]);
                 let remap = |i: usize| i - ix + base;
@@ -923,16 +943,18 @@ pub mod incremental {
                         items: node.items,
                     });
                 }
-                inos.extend_from_slice(&cached.inos[ix..end]);
-                marks.extend(cached.marks_in(ix, end).iter().map(|&(k, m)| (remap(k), m)));
+                meta.inos.extend_from_slice(&cached.inos[ix..end]);
+                meta.stamps.extend_from_slice(&cached.stamps[ix..end]);
+                meta.marks.extend(cached.marks_in(ix, end).iter().map(|&(k, m)| (remap(k), m)));
                 base
             }
-            Part::Dir { name, size, items, ino, children } => {
+            Part::Dir { name, size, items, ino, stamp, children } => {
                 let ix = nodes.len();
                 nodes.push(Node { name: name.into(), size, kind: Kind::Dir, parent, children: Vec::with_capacity(children.len()), items });
-                inos.push(ino);
+                meta.inos.push(ino);
+                meta.stamps.push(stamp);
                 for child in children {
-                    let child_ix = emit(child, Some(ix), cached, nodes, inos, marks);
+                    let child_ix = emit(child, Some(ix), cached, nodes, meta);
                     nodes[ix].children.push(child_ix);
                 }
                 ix
@@ -1105,15 +1127,17 @@ pub fn bench(root: &Path, runs: usize) {
 }
 
 /// Time incremental rescans against full scans of `root`, checking they agree.
-pub fn bench_rescan(root: &Path, runs: usize) {
+/// False if any run mismatched.
+pub fn bench_rescan(root: &Path, runs: usize) -> bool {
     println!("(on a live tree, an occasional MISMATCH can be real changes between the two scans)");
     let (tree, save) = scan_cached(root, &Progress::default(), true);
     let Some(save) = save else {
         println!("no FSEvents history for this volume (or it's external): every scan is full");
-        return;
+        return true;
     };
     save.save(&tree);
     drop(tree);
+    let mut all_ok = true;
     for run in 0..runs {
         let start = std::time::Instant::now();
         let (incr, save) = scan_cached(root, &Progress::default(), false);
@@ -1138,10 +1162,12 @@ pub fn bench_rescan(root: &Path, runs: usize) {
         let gate = if a == b && (incr.errors, incr.cloud_only) == (full.errors, full.cloud_only) {
             "gate ok".to_string()
         } else {
+            all_ok = false;
             format!("MISMATCH ({differ} paths differ, {structural} in paths or item counts)")
         };
         println!("run {run}: incremental {incr_s:.3} s ({how}) full {full_s:.3} s {gate}");
     }
+    all_ok
 }
 
 /// Bytes in use on the volume, if `root` is the top of a volume (so a full scan of
@@ -1173,9 +1199,10 @@ pub fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-fn flatten(raw: Raw, parent: Option<usize>, nodes: &mut Vec<Node>, inos: &mut Vec<u64>) -> usize {
+fn flatten(raw: Raw, parent: Option<usize>, nodes: &mut Vec<Node>, inos: &mut Vec<u64>, stamps: &mut Vec<u64>) -> usize {
     let ix = nodes.len();
     inos.push(raw.ino);
+    stamps.push(raw.stamp);
     nodes.push(Node {
         name: raw.name.into(),
         size: raw.size,
@@ -1185,7 +1212,7 @@ fn flatten(raw: Raw, parent: Option<usize>, nodes: &mut Vec<Node>, inos: &mut Ve
         items: raw.items,
     });
     for child in raw.children {
-        let child_ix = flatten(child, Some(ix), nodes, inos);
+        let child_ix = flatten(child, Some(ix), nodes, inos, stamps);
         nodes[ix].children.push(child_ix);
     }
     ix
@@ -1405,6 +1432,8 @@ mod tests {
         let cached = crate::cache::decode(&buf).unwrap();
         assert_eq!(cached.header, header);
         assert_eq!(cached.inos, meta.inos);
+        assert_eq!(cached.stamps, meta.stamps);
+        assert!(meta.stamps[Tree::ROOT] != 0);
         assert_eq!(cached.marks, meta.marks);
         let decoded = Tree { root_path: dir.clone(), nodes: cached.nodes, errors: 0, cloud_only: 0 };
         assert_eq!(fingerprint(&decoded), fingerprint(&tree));
@@ -1490,6 +1519,8 @@ mod tests {
         let (result, _) = rescan(&dir, cache_of(&tree, &meta), &["a"]);
         assert_eq!(result.err(), Some(incremental::Fallback::HardLinks));
         // Links off the changed path are fine.
+        let (tree, meta) = full(&dir);
+        write(&dir.join("b/h"), 1);
         let (result, _) = rescan(&dir, cache_of(&tree, &meta), &["b"]);
         assert!(result.is_ok());
         fs::remove_dir_all(&dir).unwrap();
@@ -1513,6 +1544,72 @@ mod tests {
         assert_eq!(b.errors, 0);
         assert_eq!(fingerprint(&b), fingerprint(&c));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Undoes `access`'s changes even if a test fails, so the fixture can be deleted.
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("chmod").args(["-R", "-N"]).arg(&self.0).status();
+            let _ = std::process::Command::new("chmod").args(["-R", "u+rwx"]).arg(&self.0).status();
+        }
+    }
+
+    /// A group this user is in other than `path`'s, so `chgrp` needs no privileges.
+    fn other_group(path: &Path) -> u32 {
+        let current = fs::metadata(path).unwrap().gid();
+        let out = std::process::Command::new("id").arg("-G").output().unwrap();
+        String::from_utf8(out.stdout).unwrap().split_whitespace().map(|g| g.parse().unwrap()).find(|&g| g != current).expect("a second group")
+    }
+
+    /// Ways to change a folder's access without touching its contents or its parent's listing.
+    fn access(change: &str, path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        match change {
+            "chmod" => fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap(),
+            "chgrp" => std::os::unix::fs::chown(path, None, Some(other_group(path))).unwrap(),
+            // An ACL alone: the POSIX mode stays as it was.
+            "acl" => assert!(std::process::Command::new("chmod").args(["+a", "everyone deny list,search"]).arg(path).status().unwrap().success()),
+            _ => unreachable!(),
+        }
+    }
+
+    /// The parent's event is all a mode, owner or ACL change of a clean folder brings; its
+    /// cached subtree must not be reused, and the result must stay right on later rescans.
+    #[test]
+    fn incremental_sees_access_changes() {
+        for change in ["chmod", "chgrp", "acl"] {
+            let dir = std::env::temp_dir().join(format!("petal-incr-access-{change}-{}", std::process::id()));
+            let _restore = Restore(dir.clone());
+            let _ = fs::remove_dir_all(&dir);
+            write(&dir.join("a/b/c/file"), 300_000);
+            write(&dir.join("a/b/c/d/deeper"), 5000);
+            for i in 0..5 {
+                write(&dir.join(format!("a/b/sib{i}/f")), 1000);
+            }
+            let (a, meta) = full(&dir);
+            access(change, &dir.join("a/b/c"));
+            let (b, progress) = rescan(&dir, cache_of(&a, &meta), &["a/b"]);
+            let (b, meta_b) = b.unwrap();
+            let (c, meta_c) = full(&dir);
+            assert_eq!(fingerprint(&b), fingerprint(&c), "{change}");
+            assert_eq!((b.errors, b.cloud_only), (c.errors, c.cloud_only), "{change}");
+            assert_eq!(meta_b.marks, meta_c.marks, "{change}");
+            if change != "chgrp" {
+                assert!(c.errors > 0 && c.find(&dir.join("a/b/c/file")).is_none(), "{change}: c is unreadable now");
+            }
+            // root, a, b re-listed, c walked again (and d, if readable); the siblings reused.
+            let reused = progress.reused_dirs.load(Ordering::Relaxed);
+            assert_eq!(reused, 5, "{change}");
+            assert!(progress.dirs.load(Ordering::Relaxed) - reused >= 4, "{change}: c was reused");
+            // Saved and loaded again, a quiet rescan stays right.
+            let (quiet, _) = rescan(&dir, cache_of(&b, &meta_b), &[]);
+            let quiet = quiet.unwrap().0;
+            assert_eq!(fingerprint(&quiet), fingerprint(&c), "{change}");
+            assert_eq!(quiet.errors, c.errors, "{change}");
+            drop(_restore);
+            fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     /// Real FSEvents history: a cached scan, then changes, then an incremental rescan
@@ -1559,10 +1656,43 @@ mod tests {
         }
 
         let (incr, save) = scan_cached(&dir, &Progress::default(), false);
-        assert!(matches!(save.unwrap().how, How::Incremental { reused, .. } if reused > 0));
+        let save = save.unwrap();
+        assert!(matches!(save.how, How::Incremental { reused, .. } if reused > 0));
         let full = scan(&dir, &Progress::default());
         assert_eq!(fingerprint(&incr), fingerprint(&full));
         assert_eq!((incr.errors, incr.cloud_only), (full.errors, full.cloud_only));
+        save.save(&incr);
+
+        // Access changes: the event names only the parent. Each must converge to a full scan,
+        // and stay converged on a quiet rescan from the saved result.
+        let _restore = Restore(dir.clone());
+        for (change, target) in [("chgrp", "clean/n1"), ("chmod", "clean/n2"), ("acl", "clean/n3")] {
+            let since = cache::load(&dir, &fsevents::device_uuid(dev).unwrap(), onboarding::has_full_disk_access()).unwrap().header.event_id;
+            access(change, &dir.join(target));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let changes = fsevents::changes_since(dev, &mount, &canonical, since);
+                let fsevents::Changes::Dirs(dirs) = &changes else { panic!("{changes:?}") };
+                if dirs.iter().any(|d| d.0 == Path::new("clean") || d.0 == Path::new(target)) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "{change}: event never arrived: {dirs:?}");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            for round in ["after the event", "quiet"] {
+                let (incr, save) = scan_cached(&dir, &Progress::default(), false);
+                let save = save.unwrap();
+                let full = scan(&dir, &Progress::default());
+                assert!(matches!(save.how, How::Incremental { .. }), "{change} {round}: {:?}", save.how);
+                assert_eq!(fingerprint(&incr), fingerprint(&full), "{change} {round}");
+                assert_eq!((incr.errors, incr.cloud_only), (full.errors, full.cloud_only), "{change} {round}");
+                save.save(&incr);
+            }
+            if change != "chgrp" {
+                assert!(scan(&dir, &Progress::default()).errors > 0, "{change}: {target} is unreadable now");
+            }
+        }
+        drop(_restore);
         fs::remove_dir_all(&dir).unwrap();
         let _ = fs::remove_dir_all(dir.with_extension("cache"));
     }

@@ -14,7 +14,7 @@ use crate::scan::{Kind, Mark, Node, ScanMeta, Tree};
 
 const MAGIC: &[u8; 8] = b"PETALSC1";
 /// Bump whenever scan semantics change.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const TAG_FILE: u8 = 0;
 const TAG_DIR: u8 = 1;
 const TAG_MARKED: u8 = 0x80;
@@ -36,6 +36,7 @@ pub struct Cached {
     /// Pre-order: node `ix`'s subtree is `ix..sub_end[ix]`.
     pub nodes: Vec<Node>,
     pub inos: Vec<u64>,
+    pub stamps: Vec<u64>,
     /// Sorted by node index.
     pub marks: Vec<(usize, Mark)>,
     pub sub_end: Vec<usize>,
@@ -98,6 +99,7 @@ pub fn encode(tree: &Tree, meta: &ScanMeta, header: &Header) -> Vec<u8> {
             put_varint(&mut out, own);
             put_varint(&mut out, node.children.iter().filter(|c| real(c)).count() as u64);
             put_varint(&mut out, meta.inos.get(ix).copied().unwrap_or(0));
+            put_varint(&mut out, meta.stamps.get(ix).copied().unwrap_or(0));
         }
         if let Some(mark) = mark {
             put_varint(&mut out, mark.errors);
@@ -136,6 +138,7 @@ pub fn decode(buf: &[u8]) -> Option<Cached> {
     }
     let mut nodes: Vec<Node> = Vec::with_capacity(count);
     let mut inos = Vec::with_capacity(count);
+    let mut stamps = Vec::with_capacity(count);
     let mut sub_end = vec![0; count];
     let mut marks = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
@@ -161,11 +164,13 @@ pub fn decode(buf: &[u8]) -> Option<Cached> {
         let (size, items, ino) = if kind == Kind::File { (r.varint()?, 1, 0) } else { (0, 0, 0) };
         nodes.push(Node { name: name.to_owned().into(), size, kind, parent, children: Vec::new(), items });
         if kind == Kind::Dir {
-            let (own, left, ino) = (r.varint()?, r.varint()?, r.varint()?);
+            let (own, left, ino, stamp) = (r.varint()?, r.varint()?, r.varint()?, r.varint()?);
             inos.push(ino);
+            stamps.push(stamp);
             stack.push(Frame { ix, left, own });
         } else {
             inos.push(ino);
+            stamps.push(0);
             sub_end[ix] = ix + 1;
         }
         if tag & TAG_MARKED != 0 {
@@ -189,7 +194,7 @@ pub fn decode(buf: &[u8]) -> Option<Cached> {
         return None;
     }
     let header = Header { root, device_uuid, event_id, root_ino, has_fda };
-    Some(Cached { header, nodes, inos, marks, sub_end })
+    Some(Cached { header, nodes, inos, stamps, marks, sub_end })
 }
 
 /// Bundle id, so the unbundled binary shares the app's cache.
@@ -283,6 +288,10 @@ impl<'a> Reader<'a> {
         let mut v = 0u64;
         for shift in (0..64).step_by(7) {
             let b = self.byte()?;
+            // The tenth byte holds bit 63 only; anything more doesn't fit a u64.
+            if shift == 63 && b > 1 {
+                return None;
+            }
             v |= ((b & 0x7f) as u64).checked_shl(shift)?;
             if b & 0x80 == 0 {
                 return Some(v);
@@ -294,5 +303,61 @@ impl<'a> Reader<'a> {
     fn bytes(&mut self) -> Option<&'a [u8]> {
         let n = usize::try_from(self.varint()?).ok()?;
         self.take(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn varint(bytes: &[u8]) -> Option<u64> {
+        let mut r = Reader { buf: bytes, pos: 0 };
+        r.varint().filter(|_| r.pos == bytes.len())
+    }
+
+    #[test]
+    fn varint_rejects_overflow() {
+        let mut max = Vec::new();
+        put_varint(&mut max, u64::MAX);
+        assert_eq!(max, [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]);
+        assert_eq!(varint(&max), Some(u64::MAX));
+        let tenth = |b: u8| [0x80; 9].into_iter().chain([b]).collect::<Vec<_>>();
+        assert_eq!(varint(&tenth(0x01)), Some(1 << 63));
+        assert_eq!(varint(&tenth(0x02)), None, "bit 64");
+        assert_eq!(varint(&tenth(0x7f)), None);
+        assert_eq!(varint(&tenth(0x81)), None, "an eleventh byte");
+        assert_eq!(varint(&[0x80; 3]), None, "truncated");
+    }
+
+    /// A one-folder cache with a valid checksum around `own`, the folder's raw varint bytes.
+    fn one_dir(own: &[u8]) -> Vec<u8> {
+        let mut fields = Vec::new();
+        put_bytes(&mut fields, b"/x");
+        put_bytes(&mut fields, b"uuid");
+        put_varint(&mut fields, 1);
+        put_varint(&mut fields, 2);
+        fields.push(1);
+        put_varint(&mut fields, 1);
+        let mut out = MAGIC.to_vec();
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        put_bytes(&mut out, &fields);
+        out.push(TAG_DIR);
+        put_bytes(&mut out, b"x");
+        out.extend_from_slice(own);
+        for v in [0, 3, 4] {
+            put_varint(&mut out, v);
+        }
+        let sum = fnv1a(&out);
+        out.extend_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn decode_rejects_overflowing_varint() {
+        let cached = decode(&one_dir(&[0x05])).unwrap();
+        assert_eq!((cached.nodes[0].size, cached.inos[0], cached.stamps[0]), (5, 3, 4));
+        let mut overflow = vec![0x80; 9];
+        overflow.push(0x02);
+        assert!(decode(&one_dir(&overflow)).is_none());
     }
 }
