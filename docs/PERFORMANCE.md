@@ -29,27 +29,21 @@ system-wide filesystem lock when it's warm.
 - *More threads, several processes, `searchfs` (catalog search), Spotlight.* No gain (the lock is
   system-wide), or slower than the parallel walk, or blind to most of the disk (Spotlight skips
   `~/Library`, hidden folders and system areas).
-- *Round 2 bundle (reverted): entry names as `SharedString` from the listing on, a presized flatten
-  Vec, the current-folder label every 64th folder, skip/hotspot lookups only down to the deepest
-  entry.* Keep rule, agreed in advance: on `/System/Library`, B/A ≤ 0.99 with B faster in ≥ 7/10
-  pairs, reproducibly; no reproducible median regression on `~/Library`. Every result is listed below,
-  including the failing and noisy ones.
-  - Per step, each B/A against the step before, on `/System/Library` unless noted. Names: 0.991 (7/10),
-    0.968 (6/10), `~/Library` 1.143, 1.041, 0.986. Presized Vec: flatten 0.019 s → 0.011 s; 1+2 vs
-    baseline 0.980 (5/10); 2 vs 1 alone 0.990 (6/10, exact counts) and 0.960 (3/10, count tolerance 5).
-    Label throttle: 1.001 (8/10), `~/Library` 1.004. Depth gate: 1.010 (3/10), `~/Library` 0.991.
-  - First pass, bundle vs baseline: `/System/Library` 0.940 (7/10) and 0.967 (8/10) with count
-    tolerance 5; `~/Library` 1.223 (6/10), 0.947 (10/10), 1.092 (8/10). The reviewer's rerun on
-    `/System/Library` gave 1.003 (5/10).
-  - Re-check, 3 independent rounds on `/System/Library` with exact counts (it was stable that day):
-    1.018 (5/10), 1.016 (3/10), 1.010 (3/10). This fails the rule, so steps 1–4 were reverted.
-  - Re-check, `~/Library`, count tolerance 10. At the default 1 MB byte tolerance, three rounds stopped
-    early on byte drift between back-to-back scans. At a 200 MB byte tolerance: 1.126 (3/8), 1.010
-    (3/8), one stopped early on count drift (17 files). A further 0.532 (5/8) overlapped another run
-    and doesn't count.
-  - Not done: the exact baseline fingerprint check (files=297777 nodes=459648). `/System/Library`
-    drifted to files=297799 nodes=459670 over the session, and `~/Library` keeps changing, so no fixed
-    reference was left to check against. A/B runs still compared A and B within each pair.
+- *Round 2 bundle (rejected and reverted): entry names as `SharedString`, a presized flatten Vec,
+  current-folder updates every 64th folder, and depth-gated skip/hotspot lookups.* The agreed keep
+  rule required reproducible `/System/Library` B/A ≤ 0.99 and B faster in ≥ 7/10 pairs, with no
+  reproducible median regression on `~/Library`.
+  Three independent baseline-vs-bundle re-checks on `/System/Library` gave B/A **1.018 (5/10)**,
+  **1.016 (3/10)** and **1.010 (3/10)**. All failed the keep rule, so steps 1–4 were reverted.
+  These rounds used `COUNT_TOLERANCE=0` and the default `TOLERANCE=1000000` bytes; each reported
+  files=297799, nodes=459670, bytes=28356595712. Exact counts did not require a byte-exact gate.
+  The isolated step-2 comparison (steps 1+2 vs step 1) gave 0.990 (6/10) at count tolerance 0 and
+  0.960 (3/10) at count tolerance 5; neither met the keep rule.
+  Secondary `~/Library` re-checks (`COUNT_TOLERANCE=10`): at the default byte tolerance, two rounds
+  aborted on byte drift; 0.532 (5/8) and 1.126 (3/8) came from overlapping runs and are invalid
+  performance evidence; 1.010 (3/8) completed at `TOLERANCE=200000000`, which alone does not
+  establish reproducible non-regression. The historical exact baseline-fingerprint check could not
+  be completed because the trees drifted; matching A/B counts within pairs is not that historical check.
 - *Walking one subfolder inline instead of as a rayon task.* Fan-out ≤ 1: 0.977 (6/10), 1.048 (5/10),
   `~/Library` 1.038. Fan-out ≤ 2: 0.891 (8/10), 0.963 (4/10), 1.028 (3/10), 0.934 (8/10), `~/Library` 0.963.
   Pairs won only 23/40: no consistent win.
