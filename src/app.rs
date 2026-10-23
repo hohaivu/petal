@@ -290,11 +290,16 @@ impl Results {
         }
     }
 
+    /// In the Collector, itself or inside a collected folder.
+    fn is_collected(&self, ix: usize) -> bool {
+        self.collector.iter().any(|&c| self.tree.is_ancestor_or_self(c, ix))
+    }
+
     fn collect(&mut self, ix: usize) {
         if ix == Tree::ROOT || self.tree.nodes[ix].parent.is_none() || self.tree.nodes[ix].kind == Kind::Other {
             return;
         }
-        if self.collector.iter().any(|&c| self.tree.is_ancestor_or_self(c, ix)) {
+        if self.is_collected(ix) {
             return;
         }
         let tree = &self.tree;
@@ -923,13 +928,16 @@ impl Petal {
         match &self.screen {
             Screen::Results(r) => {
                 let can_go_up = r.tree.nodes[r.focus].parent.is_some();
-                bar = bar.child(
-                    button("up", "‹")
-                        .text_base()
-                        .px_2()
-                        .when(!can_go_up, |b| b.opacity(0.4))
-                        .on_click(cx.listener(|this, _, window, cx| this.go_up(&GoUp, window, cx))),
-                );
+                let back = button("up", "‹")
+                    .p_0()
+                    .w(px(36.))
+                    .h(px(30.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_lg()
+                    .when(!can_go_up, |b| b.opacity(0.4))
+                    .on_click(cx.listener(|this, _, window, cx| this.go_up(&GoUp, window, cx)));
                 let chain = r.tree.ancestry(r.focus);
                 let mut crumbs = div().flex().items_center().gap_1().min_w_0().overflow_hidden();
                 for (i, &ix) in chain.iter().enumerate() {
@@ -960,7 +968,17 @@ impl Petal {
                             .child(r.tree.nodes[ix].name.clone()),
                     );
                 }
-                bar = bar.child(crumbs).child(div().flex_1());
+                let cluster = div()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    // Near-misses around ‹ and the crumbs must never drag or zoom the window.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(back)
+                    .child(crumbs);
+                bar = bar.child(cluster).child(div().flex_1());
                 bar = bar
                     .child(
                         div().text_xs().text_color(rgb(MUTED)).flex_none().child(format!(
@@ -1500,7 +1518,14 @@ impl Petal {
     fn render_findings(&self, findings: &[Finding], interactive: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let safe: u64 = findings.iter().filter(|f| f.safety == Safety::Safe).map(|f| f.size).sum();
         let mut list = div().id("findings").max_h(px(250.)).overflow_y_scroll().flex().flex_col().gap_0p5();
+        let results = match &self.screen {
+            Screen::Results(r) => Some(r),
+            _ => None,
+        };
         for (i, finding) in findings.iter().enumerate() {
+            let collected = interactive
+                && !finding.nodes.is_empty()
+                && results.is_some_and(|r| finding.nodes.iter().all(|&n| r.is_collected(n)));
             let (tag, color) = match finding.safety {
                 Safety::Safe => ("Safe to delete", 0x3fb950),
                 Safety::Review => ("Review first", 0xd29922),
@@ -1511,6 +1536,7 @@ impl Petal {
                 div()
                     .id(("finding", i))
                     .group("finding")
+                    .when(collected, |d| d.opacity(0.4))
                     .px_2()
                     .py_1()
                     .rounded_md()
@@ -1530,7 +1556,7 @@ impl Petal {
                             .items_center()
                             .gap_2()
                             .child(div().size(px(8.)).flex_none().rounded_full().bg(rgb(color)))
-                            .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(finding.title))
+                            .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::MEDIUM).when(collected, |d| d.line_through()).child(finding.title))
                             .child(
                                 div()
                                     .flex_none()
@@ -1540,7 +1566,7 @@ impl Petal {
                                     .when(finding.pending, |d| d.text_color(rgb(MUTED)))
                                     .child(if finding.pending { "…".to_string() } else { format_size(finding.size) }),
                             )
-                            .when(interactive, |d| {
+                            .when(interactive && !collected, |d| {
                                 d.child(
                                     icon_button(("collect-finding", i), "+", "Add to Collector")
                                         .invisible()
@@ -1612,10 +1638,12 @@ impl Petal {
                 let is_dir = node.kind == Kind::Dir;
                 let dragged = DraggedItem { node: ix, name: node.name.clone(), size: node.size };
                 let path = r.tree.path_of(ix);
+                let collected = r.is_collected(ix);
 
                 div()
                     .id(("row", ix))
                     .w_full()
+                    .when(collected, |d| d.opacity(0.4))
                     .h(px(ROW_HEIGHT))
                     .px_2()
                     .flex()
@@ -1648,7 +1676,7 @@ impl Petal {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(div().truncate().child(node.name.clone()))
+                            .child(div().truncate().when(collected, |d| d.line_through()).child(node.name.clone()))
                             .child(
                                 div()
                                     .h(px(2.))
@@ -1667,16 +1695,18 @@ impl Petal {
                                 },
                             )),
                         )
-                        .child(icon_button(("collect", ix), "+", "Add to Collector").on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                if let Some(r) = this.results() {
-                                    r.collect(ix);
-                                }
-                                this.collector_changed(cx);
-                                cx.notify();
-                            },
-                        )))
+                        .when(!collected, |d| {
+                            d.child(icon_button(("collect", ix), "+", "Add to Collector").on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(r) = this.results() {
+                                        r.collect(ix);
+                                    }
+                                    this.collector_changed(cx);
+                                    cx.notify();
+                                },
+                            )))
+                        })
                     })
                     .child(
                         div()
@@ -2014,14 +2044,17 @@ impl Petal {
 fn icon_button(id: impl Into<gpui::ElementId>, glyph: &'static str, _tooltip: &'static str) -> Stateful<gpui::Div> {
     div()
         .id(id)
-        .size(px(20.))
+        .size(px(24.))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
         .rounded_md()
+        .text_base()
         .text_color(rgb(MUTED))
         .cursor_pointer()
+        // Keep a press here from starting a row drag or opening the row.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .hover(|s| s.bg(rgb(BORDER)).text_color(rgb(TEXT)))
         .child(glyph)
 }
